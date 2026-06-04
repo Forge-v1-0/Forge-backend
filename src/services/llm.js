@@ -1,19 +1,17 @@
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
-
-export const MODELS = {
+export const DEFAULT_MODELS = {
   planner: 'anthropic/claude-3.5-sonnet',
   coder: 'poolside/laguna-m.1:free'
 }
 
-export async function callLLM(messages, model = MODELS.planner) {
-  if (!OPENROUTER_API_KEY) {
-    throw new Error('OPENROUTER_API_KEY not set')
+export async function callLLM(messages, model, apiKey) {
+  if (!apiKey) {
+    throw new Error('No OpenRouter API key provided')
   }
 
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
       'HTTP-Referer': 'https://github.com/vitoraos/coder-agent',
       'X-Title': 'coder-agent'
@@ -40,9 +38,8 @@ export async function callLLM(messages, model = MODELS.planner) {
   return data.choices[0].message.content
 }
 
-// Only used for planner — strips code fences before parsing
-export async function callLLMJson(messages, model = MODELS.planner) {
-  const raw = await callLLM(messages, model)
+export async function callLLMJson(messages, model, apiKey) {
+  const raw = await callLLM(messages, model, apiKey)
 
   const cleaned = raw
     .replace(/^```json\s*/i, '')
@@ -55,4 +52,4 @@ export async function callLLMJson(messages, model = MODELS.planner) {
   } catch {
     throw new Error(`LLM returned invalid JSON:\n${raw}`)
   }
-      }
+}
