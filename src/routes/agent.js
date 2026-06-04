@@ -51,10 +51,89 @@ export default async function agentRoutes(fastify) {
     return reply.send({ ok: true, session_id: session.id })
   })
 
+  // ─── APPROVE PLAN ────────────────────────────────────────────────
+  fastify.post('/agent/approve-plan', async (req, reply) => {
+    const { session_id } = req.body
+    if (!session_id) return reply.status(400).send({ error: 'Missing session_id' })
+
+    const { data: session, error } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('id', session_id)
+      .single()
+
+    if (error || !session || session.status !== 'plan_review') {
+      return reply.status(400).send({ error: 'Session not in plan_review status' })
+    }
+
+    // Update status to coding
+    await supabase.from('sessions').update({ status: 'coding' }).eq('id', session_id)
+
+    const { data: repo } = await supabase
+      .from('repos')
+      .select('owner_id')
+      .eq('id', session.repo_id)
+      .single()
+
+    if (!repo) return reply.status(404).send({ error: 'Repo not found' })
+
+    // Run coder loop in background
+    runCoderLoop({
+      fastify,
+      supabase,
+      sessionId: session_id,
+      repoId: session.repo_id,
+      ownerId: repo.owner_id
+    }).catch(async (err) => {
+      console.error(`Coder loop failed:`, err.message)
+      await supabase.from('sessions').update({ status: 'failed' }).eq('id', session_id)
+    })
+
+    return reply.send({ ok: true })
+  })
+
+  // ─── EDIT PLAN ───────────────────────────────────────────────────
+  fastify.post('/agent/edit-plan', async (req, reply) => {
+    const { session_id, subtasks } = req.body
+    if (!session_id || !subtasks) {
+      return reply.status(400).send({ error: 'Missing session_id or subtasks' })
+    }
+
+    const { data: session } = await supabase
+      .from('sessions')
+      .select('status, plan')
+      .eq('id', session_id)
+      .single()
+
+    if (!session || session.status !== 'plan_review') {
+      return reply.status(400).send({ error: 'Session not in plan_review status' })
+    }
+
+    // Delete old pending tasks and replace with edited ones
+    await supabase.from('tasks').delete().eq('session_id', session_id).eq('status', 'pending')
+
+    for (const subtask of subtasks) {
+      await supabase.from('tasks').insert({
+        session_id,
+        type: 'WRITE',
+        instruction: subtask.instruction,
+        file_path: subtask.file_path,
+        status: 'pending'
+      })
+    }
+
+    // Update the stored plan JSON as well
+    if (session.plan) {
+      session.plan.subtasks = subtasks
+      await supabase.from('sessions').update({ plan: session.plan }).eq('id', session_id)
+    }
+
+    return reply.send({ ok: true })
+  })
+
   // ─── GET SESSION STATUS ──────────────────────────────────────────
   fastify.get('/agent/session/:id', async (req, reply) => {
     const { id } = req.params
-
     const { data, error } = await supabase
       .from('sessions')
       .select(`
@@ -73,7 +152,6 @@ export default async function agentRoutes(fastify) {
   // ─── APPROVE DRAFT ───────────────────────────────────────────────
   fastify.post('/agent/approve', async (req, reply) => {
     const { draft_id } = req.body
-
     if (!draft_id) {
       return reply.status(400).send({ error: 'Missing draft_id' })
     }
@@ -208,8 +286,8 @@ export default async function agentRoutes(fastify) {
   })
 }
 
-// ─── BACKGROUND: FULL AGENT LOOP ──────────────────────────────────
-async function runAgentLoop({
+// ─── BACKGROUND: PLAN PHASE ─────────────────────────────────────────
+export async function runAgentLoop({
   fastify,
   supabase,
   sessionId,
@@ -238,26 +316,70 @@ async function runAgentLoop({
     })
   }
 
-  // Update session to coding
+  // Save plan to session and pause for human review
   await supabase
     .from('sessions')
-    .update({ status: 'coding' })
+    .update({
+      status: 'plan_review',
+      plan: {
+        analysis: plan.analysis,
+        subtasks: plan.subtasks
+      }
+    })
     .eq('id', sessionId)
+}
+
+// ─── BACKGROUND: CODER PHASE ────────────────────────────────────────
+export async function runCoderLoop({
+  fastify,
+  supabase,
+  sessionId,
+  repoId,
+  ownerId
+}) {
+  // Load user LLM config
+  const { apiKey, plannerModel, coderModel } = await fastify.getUserLLMConfig(ownerId)
+
+  // CRITICAL FOR RECOVERY: Reset any tasks stuck in 'running' due to a previous crash
+  await supabase
+    .from('tasks')
+    .update({ status: 'pending' })
+    .eq('session_id', sessionId)
+    .eq('status', 'running')
 
   // Load tasks back in order
   const { data: tasks } = await supabase
     .from('tasks')
     .select('*')
     .eq('session_id', sessionId)
+    .eq('status', 'pending')
     .order('created_at', { ascending: true })
+
+  if (!tasks || tasks.length === 0) {
+    await supabase.from('sessions').update({ status: 'done' }).eq('id', sessionId)
+    return
+  }
+
+  // Update session to coding
+  await supabase
+    .from('sessions')
+    .update({ status: 'coding' })
+    .eq('id', sessionId)
 
   // Get repo details for GitHub
   const { pat, repo } = await fastify.getRepoPat(repoId)
   const github = createGithubClient(pat, repo)
 
+  // Load plan for risk info
+  const { data: session } = await supabase
+    .from('sessions')
+    .select('plan')
+    .eq('id', sessionId)
+    .single()
+
   // Get planner subtask details for risk info
   const subtaskMap = {}
-  for (const s of plan.subtasks) {
+  for (const s of (session?.plan?.subtasks || [])) {
     subtaskMap[s.file_path] = s
   }
 
@@ -343,9 +465,10 @@ async function runFeedbackLoop({
   originalTask
 }) {
   const { apiKey, plannerModel, coderModel } = await fastify.getUserLLMConfig(ownerId)
-
   const context = await buildContext(supabase, repoId)
-  const memory = await loadMemory(supabase, repoId)
+  
+  // FILTERED MEMORY: Only load memory relevant to this specific file
+  const memory = await loadMemory(supabase, repoId, [draft.file_path])
 
   // Planner rereplans the single failed subtask
   const replan = await replanSubtask({
