@@ -3,10 +3,10 @@ import cors from '@fastify/cors'
 import supabase from './services/supabase.js'
 import agentRoutes from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
+import settingsRoutes from './routes/settings.js'
 
 const fastify = Fastify({ logger: true })
 
-// Attach supabase to fastify instance so routes can access it
 fastify.decorate('supabase', supabase)
 
 await fastify.register(cors, {
@@ -15,6 +15,7 @@ await fastify.register(cors, {
 
 await fastify.register(agentRoutes)
 await fastify.register(reposRoutes)
+await fastify.register(settingsRoutes)
 
 const port = process.env.PORT || 3000
 
