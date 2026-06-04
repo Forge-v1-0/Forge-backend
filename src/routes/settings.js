@@ -3,19 +3,14 @@ import { encrypt, decrypt } from '../services/crypto.js'
 export default async function settingsRoutes(fastify) {
   const supabase = fastify.supabase
 
-  // Save or update user settings
   fastify.post('/settings', async (req, reply) => {
-    const { owner_id, openrouter_api_key, planner_model, coder_model } = req.body
-
-    if (!owner_id) {
-      return reply.status(400).send({ error: 'Missing owner_id' })
-    }
+    const { openrouter_api_key, planner_model, coder_model } = req.body
+    const owner_id = req.user.id
 
     const encrypted_key = openrouter_api_key
       ? encrypt(openrouter_api_key)
       : null
 
-    // Upsert — create if not exists, update if exists
     const { data, error } = await supabase
       .from('user_settings')
       .upsert({
@@ -33,9 +28,8 @@ export default async function settingsRoutes(fastify) {
     return reply.send({ ok: true, settings: data })
   })
 
-  // Get settings — never expose the raw API key to frontend
-  fastify.get('/settings/:owner_id', async (req, reply) => {
-    const { owner_id } = req.params
+  fastify.get('/settings', async (req, reply) => {
+    const owner_id = req.user.id
 
     const { data, error } = await supabase
       .from('user_settings')
@@ -44,7 +38,6 @@ export default async function settingsRoutes(fastify) {
       .single()
 
     if (error || !data) {
-      // Return defaults if no settings saved yet
       return reply.send({
         settings: {
           planner_model: 'anthropic/claude-3.5-sonnet',
@@ -58,14 +51,12 @@ export default async function settingsRoutes(fastify) {
       settings: {
         planner_model: data.planner_model,
         coder_model: data.coder_model,
-        // Only tell frontend whether key exists, never send the actual key
         has_api_key: !!data.openrouter_api_key,
         updated_at: data.updated_at
       }
     })
   })
 
-  // Internal helper used by agent logic — decrypts key for LLM calls
   fastify.decorate('getUserLLMConfig', async (owner_id) => {
     const { data, error } = await supabase
       .from('user_settings')
@@ -74,7 +65,7 @@ export default async function settingsRoutes(fastify) {
       .single()
 
     if (error || !data) {
-      throw new Error('No settings found for user. Please add your OpenRouter API key in settings.')
+      throw new Error('No settings found. Please add your OpenRouter API key in settings.')
     }
 
     if (!data.openrouter_api_key) {
