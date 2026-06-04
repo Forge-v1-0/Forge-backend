@@ -1,10 +1,18 @@
-export async function loadMemory(supabase, repoId) {
-  const { data, error } = await supabase
+export async function loadMemory(supabase, repoId, filePaths = []) {
+  let query = supabase
     .from('agent_memory')
     .select('type, file_path, summary, created_at')
     .eq('repo_id', repoId)
     .order('created_at', { ascending: false })
-    .limit(20)
+
+  // If we know which files are involved, only load memory for those files
+  // plus any global preferences (file_path is null)
+  if (filePaths.length > 0) {
+    const formattedPaths = filePaths.map(p => `"${p}"`).join(',')
+    query = query.or(`file_path.in.(${formattedPaths}),file_path.is.null`)
+  }
+
+  const { data, error } = await query.limit(20)
 
   if (error) throw new Error(`Failed to load memory: ${error.message}`)
   if (!data || data.length === 0) return 'No past decisions on this repo yet.'
