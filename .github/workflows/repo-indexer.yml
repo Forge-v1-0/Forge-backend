@@ -1,0 +1,30 @@
+name: Repo Indexer
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps
+        run: npm install ts-morph axios @supabase/supabase-js
+
+      - name: Run indexer
+        run: node scripts/indexer.js
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          CODER_REPOSITORY: ${{ secrets.CODER_REPOSITORY }}
+          REPO_ID: ${{ secrets.CODER_REPO_ID }}
