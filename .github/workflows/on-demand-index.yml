@@ -1,0 +1,39 @@
+name: On Demand Index
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: 'owner/repo to index'
+        required: true
+      repo_id:
+        description: 'Supabase repo UUID'
+        required: true
+      pat_token:
+        description: 'GitHub PAT for the target repo'
+        required: true
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install deps
+        run: npm install ts-morph axios @supabase/supabase-js
+
+      - name: Run indexer
+        run: node scripts/indexer.js
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          PAT_TOKEN: ${{ inputs.pat_token }}
+          CODER_REPOSITORY: ${{ inputs.target_repo }}
+          REPO_ID: ${{ inputs.repo_id }}
