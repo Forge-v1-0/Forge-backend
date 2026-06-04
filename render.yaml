@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: coder-agent-server
+    name: Coder_Agent_v2
     env: node
     buildCommand: npm install
     startCommand: npm start
