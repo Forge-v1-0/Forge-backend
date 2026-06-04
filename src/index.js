@@ -1,16 +1,46 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
-import supabase from './services/supabase.js'
+import { createClient } from '@supabase/supabase-js'
 import agentRoutes from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
 
 const fastify = Fastify({ logger: true })
 
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+)
+
+const supabaseAuth = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+)
+
 fastify.decorate('supabase', supabase)
 
 await fastify.register(cors, {
   origin: process.env.FRONTEND_URL || '*'
+})
+
+fastify.addHook('preHandler', async (req, reply) => {
+  if (req.url === '/health') return
+
+  const authHeader = req.headers.authorization
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return reply.status(401).send({ error: 'Missing authorization header' })
+  }
+
+  const token = authHeader.replace('Bearer ', '')
+
+  const { data, error } = await supabaseAuth.auth.getUser(token)
+
+  if (error || !data.user) {
+    return reply.status(401).send({ error: 'Invalid or expired token' })
+  }
+
+  req.user = data.user
 })
 
 await fastify.register(agentRoutes)
