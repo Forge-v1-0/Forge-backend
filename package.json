@@ -1,0 +1,15 @@
+{
+  "name": "coder-agent-server",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "fastify": "^4.26.0",
+    "@fastify/cors": "^9.0.1"
+  }
+}
