@@ -21,6 +21,7 @@ CONSISTENCY
 - Match the existing code style exactly — spacing, naming conventions, quote style, semicolons
 - If the file uses async/await, use async/await. If it uses callbacks, use callbacks.
 - If the file uses named exports, use named exports. Match every pattern you see.
+- Respect React boundaries: if the file is a server component, do not use client hooks like useState or useEffect. If it is a client component, follow the existing hook patterns.
 
 DEFENSIVE PROGRAMMING
 - Validate function inputs before using them
