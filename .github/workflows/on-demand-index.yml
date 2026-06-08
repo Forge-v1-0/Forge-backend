@@ -7,11 +7,15 @@ on:
         description: 'owner/repo to index'
         required: true
       repo_id:
-        description: 'Supabase repo UUID'
+        description: 'Supabase repo ID'
         required: true
       pat_token:
-        description: 'GitHub PAT for the target repo'
+        description: 'GitHub PAT'
         required: true
+      source_root:
+        description: 'Source root folder (e.g., frontend, backend, apps/web)'
+        required: false
+        default: ''
 
 jobs:
   index:
@@ -27,7 +31,7 @@ jobs:
           node-version: 22
 
       - name: Install deps
-        run: npm install ts-morph axios @supabase/supabase-js
+        run: npm ci
 
       - name: Run indexer
         run: node scripts/indexer.js
@@ -37,3 +41,4 @@ jobs:
           PAT_TOKEN: ${{ inputs.pat_token }}
           CODER_REPOSITORY: ${{ inputs.target_repo }}
           REPO_ID: ${{ inputs.repo_id }}
+          SOURCE_ROOT: ${{ inputs.source_root }}
