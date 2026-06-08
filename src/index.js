@@ -22,7 +22,7 @@ await fastify.register(cors, {
 })
 
 fastify.addHook('preHandler', async (req, reply) => {
-  if (req.url === '/health') return
+  if (req.routerPath === '/health') return
   const authHeader = req.headers.authorization
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return reply.status(401).send({ error: 'Missing authorization header' })
