@@ -114,41 +114,46 @@ export async function buildContext(supabase, repoId) {
     }
   }
 
-  // ─── DESIGN SYSTEM SURFACE WITH PROPS ──────────────────────────────
-  const uiFiles = [...fileMap.entries()].filter(([p]) => p.includes('/components/ui/') || p.includes('/components/'))
-  if (uiFiles.length) {
-    lines.push('\n## Design System Surface')
-    for (const [path, info] of uiFiles) {
-      const exps = exportsByFile.get(info.id) || []
-      for (const exp of exps) {
-        if (['component', 'function', 'arrow_function'].includes(exp.kind)) {
-          const props = exp.metadata?.props
-          const propStr = props && props.length 
-            ? `{${props.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')}}`
-            : ''
-          lines.push(`  ${exp.name} (${path}) ${propStr}`)
-        }
-      }
+  // ─── COMPONENT API SURFACE (kind-based, not directory-based) ─────
+  const allExports = exports || []
+  
+  const components = allExports.filter(e => e.kind === 'component')
+  if (components.length) {
+    lines.push('\n## Component API Surface')
+    for (const c of components) {
+      const path = fileIdToPath.get(c.file_id)
+      const props = c.metadata?.props
+      const propStr = props?.length ? `{${props.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')}}` : ''
+      lines.push(`  ${c.name} (${path}) ${propStr}`)
     }
   }
 
-  if (depsByFile.size) {
-    lines.push('\n## File Dependencies')
-    for (const [fromPath, toPaths] of [...depsByFile.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      lines.push(`  ${fromPath} → ${toPaths.map(p => p.split('/').pop()).join(', ')}`)
+  // ─── HOOK API SURFACE ────────────────────────────────────────────
+  const hooks = allExports.filter(e => e.kind === 'hook')
+  if (hooks.length) {
+    lines.push('\n## Hook API Surface')
+    for (const h of hooks) {
+      const path = fileIdToPath.get(h.file_id)
+      const params = h.metadata?.props // hooks use same destructured extraction
+      const paramStr = params?.length ? `(${params.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')})` : '()'
+      lines.push(`  ${h.name} (${path}) ${paramStr}`)
     }
   }
 
-  const highRiskPaths = [...fileMap.values()]
-    .filter(f => f.role === 'middleware' || f.path.includes('supabase') || f.path.includes('auth') || f.path.includes('crypto'))
-    .map(f => f.path)
-  if (highRiskPaths.length) {
-    lines.push('\n## High-Risk Symbols (Auth, Database, Crypto)')
-    for (const p of highRiskPaths) lines.push(`  ⚠️ ${p}`)
+  // ─── FUNCTION API SURFACE (top 20 to prevent token bloat) ──────
+  const functions = allExports.filter(e => 
+    ['function', 'arrow_function', 'method', 'service', 'controller', 'route_handler'].includes(e.kind) &&
+    !['component', 'hook'].includes(e.kind)
+  )
+  if (functions.length) {
+    lines.push('\n## Function API Surface')
+    for (const f of functions.slice(0, 20)) {
+      const path = fileIdToPath.get(f.file_id)
+      const params = f.metadata?.props
+      const paramStr = params?.length ? `(${params.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')})` : '()'
+      lines.push(`  ${f.name} (${path}) ${paramStr}`)
+    }
   }
-
-  return lines.join('\n')
-}
 
 export async function getFileLanguage(supabase, repoId, filePath) {
   const { data, error } = await supabase
