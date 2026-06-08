@@ -1,14 +1,12 @@
 import { encrypt, decrypt } from '../services/crypto.js'
+import { createGithubClient } from '../services/github.js'
 
 export default async function reposRoutes(fastify) {
   const supabase = fastify.supabase
 
   // ─── DETECT SOURCE ROOTS ─────────────────────────────────────────
-  fastify.get('/repos/detect-roots', async (req, reply) => {
-    const { url, github_pat } = req.query
-    if (!url || !github_pat) {
-      return reply.status(400).send({ error: 'Missing url or github_pat' })
-    }
+  fastify.post('/repos/detect-roots', async (req, reply) => {
+  const { url, github_pat } = req.body // was req.query
 
     const repo = url.replace('https://github.com/', '').replace(/\/$/, '')
     const github = createGithubClient(github_pat, repo)
