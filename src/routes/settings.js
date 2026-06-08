@@ -57,6 +57,58 @@ export default async function settingsRoutes(fastify) {
     })
   })
 
+  fastify.delete('/settings/account', async (req, reply) => {
+    const owner_id = req.user.id
+
+    try {
+      // Get all repos for this user
+      const { data: repos } = await supabase
+        .from('repos')
+        .select('id')
+        .eq('owner_id', owner_id)
+
+      const repoIds = repos?.map(r => r.id) || []
+
+      if (repoIds.length > 0) {
+        // Get all sessions for these repos
+        const { data: sessions } = await supabase
+          .from('sessions')
+          .select('id')
+          .in('repo_id', repoIds)
+
+        const sessionIds = sessions?.map(s => s.id) || []
+
+        if (sessionIds.length > 0) {
+          // Delete dependent records in correct order
+          await supabase.from('agent_memory').delete().in('session_id', sessionIds)
+          await supabase.from('code_drafts').delete().in('session_id', sessionIds)
+          await supabase.from('tasks').delete().in('session_id', sessionIds)
+          await supabase.from('sessions').delete().in('id', sessionIds)
+        }
+
+        // Delete repo-specific records
+        await supabase.from('agent_memory').delete().in('repo_id', repoIds)
+        await supabase.from('repo_index').delete().in('repo_id', repoIds)
+        await supabase.from('repos').delete().in('id', repoIds)
+      }
+
+      // Delete user settings
+      await supabase.from('user_settings').delete().eq('owner_id', owner_id)
+
+      // Delete auth user (requires service role key)
+      const { error: authError } = await supabase.auth.admin.deleteUser(owner_id)
+      if (authError) {
+        console.error('Failed to delete auth user:', authError.message)
+        return reply.status(500).send({ error: 'Failed to delete auth user' })
+      }
+
+      return reply.send({ ok: true })
+    } catch (err) {
+      console.error('Account deletion failed:', err.message)
+      return reply.status(500).send({ error: err.message })
+    }
+  })
+
   fastify.decorate('getUserLLMConfig', async (owner_id) => {
     const { data, error } = await supabase
       .from('user_settings')
