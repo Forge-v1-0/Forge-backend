@@ -11,6 +11,28 @@ export default async function reposRoutes(fastify) {
       return reply.status(400).send({ error: 'Missing required fields' })
     }
 
+    // Validate GitHub URL format
+    if (!url.startsWith('https://github.com/')) {
+      return reply.status(400).send({ error: 'URL must be a valid GitHub repository URL' })
+    }
+
+    const repoPath = url.replace('https://github.com/', '').replace(/\/$/, '')
+
+    // Validate PAT server-side before storing
+    try {
+      const validateRes = await fetch(`https://api.github.com/repos/${repoPath}`, {
+        headers: {
+          Authorization: `Bearer ${github_pat}`,
+          Accept: 'application/vnd.github+json'
+        }
+      })
+      if (!validateRes.ok) {
+        return reply.status(400).send({ error: 'Cannot access repository. Check the URL and PAT permissions.' })
+      }
+    } catch (err) {
+      return reply.status(400).send({ error: 'Failed to validate repository access' })
+    }
+
     const encrypted_pat = encrypt(github_pat)
 
     const { data, error } = await supabase
@@ -20,7 +42,9 @@ export default async function reposRoutes(fastify) {
         url,
         github_pat: encrypted_pat,
         default_branch: default_branch || 'main',
-        owner_id
+        owner_id,
+        index_status: 'pending',
+        file_count: 0
       })
       .select()
       .single()
@@ -48,7 +72,7 @@ export default async function reposRoutes(fastify) {
 
     const { data, error } = await supabase
       .from('repos')
-      .select('id, name, url, default_branch, created_at')
+      .select('id, name, url, default_branch, index_status, file_count, created_at')
       .eq('owner_id', owner_id)
       .order('created_at', { ascending: false })
 
