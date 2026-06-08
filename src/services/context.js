@@ -114,6 +114,7 @@ export async function buildContext(supabase, repoId) {
     }
   }
 
+  // ─── DESIGN SYSTEM SURFACE WITH PROPS ──────────────────────────────
   const uiFiles = [...fileMap.entries()].filter(([p]) => p.includes('/components/ui/') || p.includes('/components/'))
   if (uiFiles.length) {
     lines.push('\n## Design System Surface')
@@ -121,7 +122,11 @@ export async function buildContext(supabase, repoId) {
       const exps = exportsByFile.get(info.id) || []
       for (const exp of exps) {
         if (['component', 'function', 'arrow_function'].includes(exp.kind)) {
-          lines.push(`  ${exp.name} (${path})`)
+          const props = exp.metadata?.props
+          const propStr = props && props.length 
+            ? `{${props.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')}}`
+            : ''
+          lines.push(`  ${exp.name} (${path}) ${propStr}`)
         }
       }
     }
