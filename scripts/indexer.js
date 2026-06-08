@@ -117,6 +117,31 @@ function computeSignature(node) {
   return crypto.createHash('md5').update(node.getText().slice(0, 500)).digest('hex').slice(0, 16)
 }
 
+// ─── PROP EXTRACTION ───────────────────────────────────────────────
+function extractProps(node) {
+  const params = node.getParameters()
+  if (params.length === 0) return null
+  
+  const firstParam = params[0]
+  
+  // Destructured: ({ variant, size, loading })
+  if (Node.isObjectBindingPattern(firstParam)) {
+    return firstParam.getElements().map(el => {
+      const name = el.getName()
+      const initializer = el.getInitializer()
+      const hasDefault = !!initializer
+      return { name, required: !hasDefault, hasDefault }
+    })
+  }
+  
+  // Props object: (props) => ...
+  if (Node.isIdentifier(firstParam)) {
+    return [{ name: firstParam.getText(), required: false, isPropsObject: true }]
+  }
+  
+  return null
+}
+
 function resolveModule(filePath, specifier, allPaths) {
   if (!specifier.startsWith('.') && !specifier.startsWith('/')) return undefined
   const dir = filePath.substring(0, filePath.lastIndexOf('/') + 1)
@@ -215,11 +240,17 @@ function analyzeFile(filePath, code, language, framework) {
   for (const fn of source.getFunctions()) {
     if (!fn.getName()) continue
     let kind = 'function'
+    let props = null
+    
     if (framework === 'nextjs' && analysis.fileRole === 'route' && ['GET','POST','PUT','DELETE','PATCH'].includes(fn.getName())) kind = 'route_handler'
     if (framework === 'nextjs' && analysis.fileRole === 'middleware' && fn.getName() === 'middleware') kind = 'middleware'
-    if ((framework === 'react' || framework === 'nextjs') && analysis.metadata.isClientComponent && fn.getName()[0] === fn.getName()[0].toUpperCase()) kind = 'component'
+    if ((framework === 'react' || framework === 'nextjs') && analysis.metadata.isClientComponent && fn.getName()[0] === fn.getName()[0].toUpperCase()) {
+      kind = 'component'
+      props = extractProps(fn)
+    }
     if ((framework === 'express' || framework === 'fastify') && analysis.fileRole === 'route' && exported) kind = 'route_handler'
-    addSymbol(fn, fn.getName(), kind)
+    
+    addSymbol(fn, fn.getName(), kind, { props })
   }
 
   // Classes
@@ -243,18 +274,25 @@ function analyzeFile(filePath, code, language, framework) {
   for (const iface of source.getInterfaces()) if (iface.getName()) addSymbol(iface, iface.getName(), 'interface')
   for (const typeAlias of source.getTypeAliases()) if (typeAlias.getName()) addSymbol(typeAlias, typeAlias.getName(), 'type')
 
-  // Variable declarations
+  // Variable declarations (arrow functions, components, hooks)
   for (const varStmt of source.getVariableStatements()) {
     for (const decl of varStmt.getDeclarations()) {
       const init = decl.getInitializer()
       let kind = 'variable'
+      let props = null
+      
       if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
         kind = 'arrow_function'
-        if ((framework === 'react' || framework === 'nextjs') && decl.getName()[0] === decl.getName()[0].toUpperCase()) kind = 'component'
+        
+        if ((framework === 'react' || framework === 'nextjs') && decl.getName()[0] === decl.getName()[0].toUpperCase()) {
+          kind = 'component'
+          props = extractProps(init)
+        }
         if ((framework === 'react' || framework === 'nextjs') && decl.getName().startsWith('use') && decl.getName().length > 3 && decl.getName()[3] === decl.getName()[3].toUpperCase()) kind = 'hook'
         if ((framework === 'vue' || framework === 'nuxt') && decl.getName().startsWith('use') && filePath.includes('composables')) kind = 'composable'
       }
-      addSymbol(decl, decl.getName(), kind)
+      
+      addSymbol(decl, decl.getName(), kind, { props })
     }
   }
 
