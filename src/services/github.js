@@ -19,9 +19,6 @@ export function createGithubClient(pat, repo) {
     const data = await res.json()
     return Buffer.from(data.content, 'base64').toString('utf8')
   }
-    if (!res.ok) return null
-    return res.text()
-  }
 
   async function getFileSha(path) {
     const res = await fetch(`${base}/contents/${path}`, { headers })
