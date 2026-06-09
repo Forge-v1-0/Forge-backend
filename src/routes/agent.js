@@ -12,6 +12,26 @@ export default async function agentRoutes(fastify) {
     timestamp: new Date().toISOString()
   }))
 
+  // ─── LIST SESSIONS ───────────────────────────────────────────────
+  fastify.get('/agent/sessions', async (req, reply) => {
+    const owner_id = req.user.id
+    const { repo_id } = req.query
+
+    let query = supabase
+      .from('sessions')
+      .select('*, repos(name, url)')
+      .eq('owner_id', owner_id)
+      .order('created_at', { ascending: false })
+
+    if (repo_id) {
+      query = query.eq('repo_id', repo_id)
+    }
+
+    const { data, error } = await query
+    if (error) return reply.status(500).send({ error: error.message })
+    return reply.send({ sessions: data || [] })
+  })
+
   // ─── START SESSION ───────────────────────────────────────────────
   fastify.post('/agent/start', async (req, reply) => {
     const { repo_id, task } = req.body
@@ -139,6 +159,123 @@ export default async function agentRoutes(fastify) {
     return reply.send({ session: data })
   })
 
+  // ─── STREAM PLAN (SSE) ─────────────────────────────────────────
+  fastify.get('/agent/session/:id/stream-plan', async (req, reply) => {
+    const { id } = req.params
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    })
+
+    let attempts = 0
+    const maxAttempts = 120 // 4 minutes max
+
+    while (attempts < maxAttempts) {
+      const { data: session } = await supabase
+        .from('sessions')
+        .select('status, plan')
+        .eq('id', id)
+        .single()
+
+      if (!session) {
+        reply.raw.write(`data: ${JSON.stringify({ error: 'Session not found' })}\n\n`)
+        reply.raw.end()
+        return reply
+      }
+
+      if (session.status === 'plan_review' && session.plan) {
+        const planText = `## Analysis\n\n${session.plan.analysis}\n\n## Subtasks\n\n` +
+          session.plan.subtasks.map((s, i) =>
+            `${i + 1}. **${s.file_path}** (${s.risk} risk)\n   ${s.instruction}${s.risk_reason ? '\n   ⚠️ ' + s.risk_reason : ''}`
+          ).join('\n\n')
+
+        const chunks = planText.match(/.{1,20}/g) || []
+        for (const chunk of chunks) {
+          reply.raw.write(`data: ${JSON.stringify({ token: chunk })}\n\n`)
+          await new Promise(r => setTimeout(r, 15))
+        }
+        reply.raw.write(`data: [DONE]\n\n`)
+        reply.raw.end()
+        return reply
+      }
+
+      if (session.status === 'failed') {
+        reply.raw.write(`data: ${JSON.stringify({ error: 'Planning failed' })}\n\n`)
+        reply.raw.end()
+        return reply
+      }
+
+      await new Promise(r => setTimeout(r, 2000))
+      attempts++
+    }
+
+    reply.raw.write(`data: ${JSON.stringify({ error: 'Timeout waiting for plan' })}\n\n`)
+    reply.raw.end()
+    return reply
+  })
+
+  // ─── STREAM CODE (SSE) ─────────────────────────────────────────
+  fastify.get('/agent/task/:id/stream-code', async (req, reply) => {
+    const { id } = req.params
+
+    reply.raw.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    })
+
+    let attempts = 0
+    const maxAttempts = 120 // 4 minutes max
+
+    while (attempts < maxAttempts) {
+      const { data: drafts } = await supabase
+        .from('code_drafts')
+        .select('new_content, explanation')
+        .eq('task_id', id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+
+      if (drafts && drafts.length > 0 && drafts[0].new_content) {
+        const draft = drafts[0]
+        const content = draft.new_content
+        const chunkSize = 30
+
+        for (let i = 0; i < content.length; i += chunkSize) {
+          const chunk = content.slice(i, i + chunkSize)
+          reply.raw.write(`data: ${JSON.stringify({ token: chunk })}\n\n`)
+          await new Promise(r => setTimeout(r, 10))
+        }
+
+        reply.raw.write(`data: ${JSON.stringify({ explanation: draft.explanation })}\n\n`)
+        reply.raw.write(`data: [DONE]\n\n`)
+        reply.raw.end()
+        return reply
+      }
+
+      // Check if task failed
+      const { data: task } = await supabase
+        .from('tasks')
+        .select('status')
+        .eq('id', id)
+        .single()
+
+      if (task?.status === 'failed') {
+        reply.raw.write(`data: ${JSON.stringify({ error: 'Coding task failed' })}\n\n`)
+        reply.raw.end()
+        return reply
+      }
+
+      await new Promise(r => setTimeout(r, 2000))
+      attempts++
+    }
+
+    reply.raw.write(`data: ${JSON.stringify({ error: 'Timeout waiting for code draft' })}\n\n`)
+    reply.raw.end()
+    return reply
+  })
+
   // ─── APPROVE DRAFT ───────────────────────────────────────────────
   fastify.post('/agent/approve', async (req, reply) => {
     const { draft_id } = req.body
@@ -194,7 +331,8 @@ export default async function agentRoutes(fastify) {
       await supabase.from('sessions').update({ status: 'done' }).eq('id', session.id)
     }
 
-    return reply.send({ ok: true, branch: branchName })
+    const githubUrl = `https://github.com/${repo}/blob/${branchName}/${draft.file_path}`
+    return reply.send({ ok: true, branch: branchName, github_url: githubUrl })
   })
 
   // ─── FEEDBACK / REVISION ─────────────────────────────────────────
