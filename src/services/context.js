@@ -134,7 +134,7 @@ export async function buildContext(supabase, repoId) {
     lines.push('\n## Hook API Surface')
     for (const h of hooks) {
       const path = fileIdToPath.get(h.file_id)
-      const params = h.metadata?.props // hooks use same destructured extraction
+      const params = h.metadata?.props
       const paramStr = params?.length ? `(${params.map(p => `${p.name}${p.required ? '' : '?'}`).join(', ')})` : '()'
       lines.push(`  ${h.name} (${path}) ${paramStr}`)
     }
@@ -154,6 +154,9 @@ export async function buildContext(supabase, repoId) {
       lines.push(`  ${f.name} (${path}) ${paramStr}`)
     }
   }
+
+  return lines.join('\n')
+}
 
 export async function getFileLanguage(supabase, repoId, filePath) {
   const { data, error } = await supabase
