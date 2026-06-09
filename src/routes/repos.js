@@ -6,7 +6,7 @@ export default async function reposRoutes(fastify) {
 
   // ─── DETECT SOURCE ROOTS ─────────────────────────────────────────
   fastify.post('/repos/detect-roots', async (req, reply) => {
-  const { url, github_pat } = req.body // was req.query
+    const { url, github_pat } = req.body
 
     const repo = url.replace('https://github.com/', '').replace(/\/$/, '')
     const github = createGithubClient(github_pat, repo)
@@ -72,13 +72,10 @@ export default async function reposRoutes(fastify) {
         url,
         github_pat: encrypted_pat,
         default_branch: default_branch || 'main',
-
         owner_id,
         index_status: 'pending',
-        file_count: 0
-
-        source_root: source_root || null,
-        owner_id
+        file_count: 0,
+        source_root: source_root || null
       })
       .select()
       .single()
