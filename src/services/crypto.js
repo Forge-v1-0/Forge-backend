@@ -1,7 +1,7 @@
 import crypto from 'crypto'
 
 const ALGORITHM = 'aes-256-cbc'
-const KEY = Buffer.from(process.env.ENCRYPTION_KEY, 'utf8').slice(0, 32)
+const KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || '').digest()
 
 export function encrypt(text) {
   const iv = crypto.randomBytes(16)

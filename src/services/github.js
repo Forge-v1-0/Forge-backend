@@ -14,10 +14,11 @@ export function createGithubClient(pat, repo) {
   }
 
   async function getFileContent(path) {
-    const branch = await getDefaultBranch()
-    const res = await fetch(
-      `https://raw.githubusercontent.com/${repo}/${branch}/${path}`
-    )
+    const res = await fetch(`${base}/contents/${path}`, { headers })
+    if (!res.ok) return null
+    const data = await res.json()
+    return Buffer.from(data.content, 'base64').toString('utf8')
+  }
     if (!res.ok) return null
     return res.text()
   }
