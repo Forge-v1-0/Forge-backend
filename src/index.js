@@ -1,7 +1,7 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { createClient } from '@supabase/supabase-js'
-import llmConfigPlugin from './plugins/llm-config.js'
+import { decrypt } from './services/crypto.js'
 import agentRoutes, { runAgentLoop, runCoderLoop } from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
@@ -17,6 +17,29 @@ const supabaseAuth = createClient(
 )
 
 fastify.decorate('supabase', supabase)
+
+// ─── ROOT DECORATOR (available to all routes) ───────────────────────
+fastify.decorate('getUserLLMConfig', async (owner_id) => {
+  const { data, error } = await fastify.supabase
+    .from('user_settings')
+    .select('openrouter_api_key, planner_model, coder_model')
+    .eq('owner_id', owner_id)
+    .single()
+
+  if (error || !data) {
+    throw new Error('No settings found. Please add your OpenRouter API key in settings.')
+  }
+
+  if (!data.openrouter_api_key) {
+    throw new Error('OpenRouter API key not set. Please add it in settings.')
+  }
+
+  return {
+    apiKey: decrypt(data.openrouter_api_key),
+    plannerModel: data.planner_model,
+    coderModel: data.coder_model
+  }
+})
 
 await fastify.register(cors, {
   origin: process.env.FRONTEND_URL || '*'
@@ -36,7 +59,6 @@ fastify.addHook('preHandler', async (req, reply) => {
   req.user = data.user
 })
 
-await fastify.register(llmConfigPlugin)
 await fastify.register(agentRoutes)
 await fastify.register(reposRoutes)
 await fastify.register(settingsRoutes)
