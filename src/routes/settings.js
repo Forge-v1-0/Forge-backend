@@ -16,8 +16,8 @@ export default async function settingsRoutes(fastify) {
       .upsert({
         owner_id,
         ...(encrypted_key ? { openrouter_api_key: encrypted_key } : {}),
-        planner_model: planner_model || 'anthropic/claude-3.5-sonnet',
-        coder_model: coder_model || 'poolside/laguna-m.1:free',
+        planner_model: planner_model || 'deepseek/deepseek-r1:free',
+        coder_model: coder_model || 'qwen/qwen3-coder:free',
         updated_at: new Date().toISOString()
       }, { onConflict: 'owner_id' })
       .select('id, owner_id, planner_model, coder_model, updated_at')
@@ -40,8 +40,8 @@ export default async function settingsRoutes(fastify) {
     if (error || !data) {
       return reply.send({
         settings: {
-          planner_model: 'anthropic/claude-3.5-sonnet',
-          coder_model: 'poolside/laguna-m.1:free',
+          planner_model: 'deepseek/deepseek-r1:free',
+          coder_model: 'qwen/qwen3-coder:free',
           has_api_key: false
         }
       })
