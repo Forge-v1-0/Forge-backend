@@ -26,12 +26,10 @@ fastify.decorate('getUserLLMConfig', async (owner_id) => {
     .eq('owner_id', owner_id)
     .single()
 
+  console.log('DEBUG getUserLLMConfig:', { owner_id, planner_model: data?.planner_model, coder_model: data?.coder_model })
+
   if (error || !data) {
     throw new Error('No settings found. Please add your OpenRouter API key in settings.')
-  }
-
-  if (!data.openrouter_api_key) {
-    throw new Error('OpenRouter API key not set. Please add it in settings.')
   }
 
   return {
