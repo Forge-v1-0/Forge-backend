@@ -29,7 +29,7 @@ async function detectFramework() {
     const res = await axios.get(url)
     const pkg = res.data
     const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }
-    
+
     if (deps['next']) return 'nextjs'
     if (deps['@nestjs/core'] || deps['@nestjs/common']) return 'nestjs'
     if (deps['vue'] || deps['vue-router'] || deps['nuxt']) return 'vue'
@@ -56,7 +56,7 @@ function detectLanguage(filePath) {
 function getFileRole(filePath, framework) {
   const relativePath = SOURCE_ROOT ? filePath.replace(`${SOURCE_ROOT}/`, '') : filePath
   const base = relativePath.split('/').pop() || ''
-  
+
   switch (framework) {
     case 'nextjs':
     case 'remix':
@@ -68,14 +68,14 @@ function getFileRole(filePath, framework) {
       if (base.startsWith('error.')) return 'error'
       if (base.startsWith('template.')) return 'template'
       return 'none'
-      
+
     case 'express':
     case 'fastify':
       if (relativePath.includes('routes') || relativePath.includes('route')) return 'route'
       if (relativePath.includes('middleware')) return 'middleware'
       if (['app.js','app.ts','server.js','server.ts','index.js','index.ts','main.js','main.ts'].includes(base)) return 'entry_point'
       return 'none'
-      
+
     case 'nestjs':
       if (base.includes('.controller.')) return 'controller'
       if (base.includes('.service.')) return 'service'
@@ -86,7 +86,7 @@ function getFileRole(filePath, framework) {
       if (base.includes('.dto.')) return 'dto'
       if (base.includes('.entity.')) return 'entity'
       return 'none'
-      
+
     case 'vue':
     case 'nuxt':
       if (base.startsWith('page.')) return 'page'
@@ -94,7 +94,7 @@ function getFileRole(filePath, framework) {
       if (base.endsWith('.vue')) return 'component'
       if (relativePath.includes('composables')) return 'composable'
       return 'none'
-      
+
     default:
       return 'none'
   }
@@ -121,9 +121,9 @@ function computeSignature(node) {
 function extractProps(node) {
   const params = node.getParameters()
   if (params.length === 0) return null
-  
+
   const firstParam = params[0]
-  
+
   // Destructured: ({ variant, size, loading })
   if (Node.isObjectBindingPattern(firstParam)) {
     return firstParam.getElements().map(el => {
@@ -133,12 +133,12 @@ function extractProps(node) {
       return { name, required: !hasDefault, hasDefault }
     })
   }
-  
+
   // Props object: (props) => ...
   if (Node.isIdentifier(firstParam)) {
     return [{ name: firstParam.getText(), required: false, isPropsObject: true }]
   }
-  
+
   return null
 }
 
@@ -171,14 +171,14 @@ async function getRepoFiles() {
   const res = await axios.get(url, {
     headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
   })
-  
+
   let files = res.data.tree.filter(f => f.type === 'blob')
-  
+
   if (SOURCE_ROOT) {
     const prefix = SOURCE_ROOT + '/'
     files = files.filter(f => f.path.startsWith(prefix))
   }
-  
+
   return files
 }
 
@@ -241,15 +241,15 @@ function analyzeFile(filePath, code, language, framework) {
     if (!fn.getName()) continue
     let kind = 'function'
     let props = null
-    
+
     if (framework === 'nextjs' && analysis.fileRole === 'route' && ['GET','POST','PUT','DELETE','PATCH'].includes(fn.getName())) kind = 'route_handler'
     if (framework === 'nextjs' && analysis.fileRole === 'middleware' && fn.getName() === 'middleware') kind = 'middleware'
     if ((framework === 'react' || framework === 'nextjs') && analysis.metadata.isClientComponent && fn.getName()[0] === fn.getName()[0].toUpperCase()) {
       kind = 'component'
       props = extractProps(fn)
     }
-    if ((framework === 'express' || framework === 'fastify') && analysis.fileRole === 'route' && exported) kind = 'route_handler'
-    
+    if ((framework === 'express' || framework === 'fastify') && analysis.fileRole === 'route' && fn.hasExportKeyword()) kind = 'route_handler'
+
     addSymbol(fn, fn.getName(), kind, { props })
   }
 
@@ -280,10 +280,10 @@ function analyzeFile(filePath, code, language, framework) {
       const init = decl.getInitializer()
       let kind = 'variable'
       let props = null
-      
+
       if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
         kind = 'arrow_function'
-        
+
         if ((framework === 'react' || framework === 'nextjs') && decl.getName()[0] === decl.getName()[0].toUpperCase()) {
           kind = 'component'
           props = extractProps(init)
@@ -291,7 +291,7 @@ function analyzeFile(filePath, code, language, framework) {
         if ((framework === 'react' || framework === 'nextjs') && decl.getName().startsWith('use') && decl.getName().length > 3 && decl.getName()[3] === decl.getName()[3].toUpperCase()) kind = 'hook'
         if ((framework === 'vue' || framework === 'nuxt') && decl.getName().startsWith('use') && filePath.includes('composables')) kind = 'composable'
       }
-      
+
       addSymbol(decl, decl.getName(), kind, { props })
     }
   }
@@ -336,7 +336,7 @@ function analyzeFile(filePath, code, language, framework) {
       const expr = call.getExpression()
       let calledName = null
       let edgeMeta = {}
-      
+
       if (Node.isIdentifier(expr)) {
         calledName = expr.getText()
       } else if (Node.isPropertyAccessExpression(expr)) {
@@ -348,7 +348,7 @@ function analyzeFile(filePath, code, language, framework) {
           analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: edgeMeta })
           continue
         }
-        
+
         if ((framework === 'express' || framework === 'fastify') && ['get','post','put','delete','patch','use'].includes(calledName)) {
           const args = call.getArguments()
           if (args.length > 0 && (Node.isStringLiteral(args[0]) || Node.isTemplateExpression(args[0]))) {
@@ -357,7 +357,7 @@ function analyzeFile(filePath, code, language, framework) {
           }
         }
       }
-      
+
       if (calledName) {
         analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: { callExpression: expr.getText() } })
       }
@@ -414,7 +414,7 @@ async function batchUpsert(table, rows, onConflict, chunkSize = 500) {
 async function run() {
   console.log(`\n🔥 Forge Universal Indexer — ${REPO} (repo_id: ${REPO_ID})`)
   if (SOURCE_ROOT) console.log(`📂 Source root: ${SOURCE_ROOT}`)
-  
+
   detectedFramework = await detectFramework()
   console.log(`🎯 Framework: ${detectedFramework}`)
 
@@ -563,25 +563,52 @@ async function run() {
     }
   }
 
+  // ─── DEDUPLICATE EDGES ───────────────────────────────────────────
+  // PostgreSQL upsert fails if the same conflict key appears twice in one batch
+  const edgeKey = (e) => `${e.from_symbol_id}|${e.to_symbol_id}|${e.edge_type}|${e.source_file_id}`
+  const seenEdges = new Set()
+  const dedupedEdges = edgesToInsert.filter(e => {
+    const key = edgeKey(e)
+    if (seenEdges.has(key)) return false
+    seenEdges.add(key)
+    return true
+  })
+
   // Bulk insert edges
-  for (let i = 0; i < edgesToInsert.length; i += 1000) {
-    const chunk = edgesToInsert.slice(i, i + 1000)
+  for (let i = 0; i < dedupedEdges.length; i += 1000) {
+    const chunk = dedupedEdges.slice(i, i + 1000)
     const { error } = await supabase.from('edges').upsert(chunk, { onConflict: 'from_symbol_id,to_symbol_id,edge_type,source_file_id' })
     if (error) { console.error(`❌ Edge batch failed: ${error.message}`); throw error }
   }
-  console.log(`🔗 ${edgesToInsert.length} edges inserted`)
+  console.log(`🔗 ${dedupedEdges.length} edges inserted (${edgesToInsert.length - dedupedEdges.length} duplicates removed)`)
 
   // Refresh deps
   const { error: rpcErr } = await supabase.rpc('refresh_file_deps', { p_repo_id: REPO_ID })
   if (rpcErr) throw rpcErr
 
-  // Update repo
+  // Update repo status to indexed
   const { data: existingSettings } = await supabase.from('repos').select('settings').eq('id', REPO_ID).single()
   const newSettings = { ...(existingSettings?.settings || {}), framework: detectedFramework }
-  await supabase.from('repos').update({ last_indexed_at: new Date().toISOString(), settings: newSettings }).eq('id', REPO_ID)
+  await supabase.from('repos').update({
+    index_status: 'indexed',
+    file_count: analyses.size,
+    last_indexed_at: new Date().toISOString(),
+    settings: newSettings
+  }).eq('id', REPO_ID)
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1)
-  console.log(`✅ Complete in ${duration}s | Files: ${analyses.size} | Symbols: ${symbolRows.length} | Edges: ${edgesToInsert.length} | Framework: ${detectedFramework}`)
+  console.log(`✅ Complete in ${duration}s | Files: ${analyses.size} | Symbols: ${symbolRows.length} | Edges: ${dedupedEdges.length} | Framework: ${detectedFramework}`)
 }
 
-run().catch(err => { console.error('Fatal:', err); process.exit(1) })
+run().catch(async err => {
+  console.error('Fatal:', err)
+  try {
+    await supabase.from('repos').update({
+      index_status: 'failed',
+      settings: { error: err.message, stack: err.stack }
+    }).eq('id', REPO_ID)
+  } catch (e) {
+    console.error('Failed to update repo status:', e.message)
+  }
+  process.exit(1)
+})

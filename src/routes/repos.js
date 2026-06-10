@@ -6,7 +6,7 @@ export default async function reposRoutes(fastify) {
 
   // ─── DETECT SOURCE ROOTS ─────────────────────────────────────────
   fastify.post('/repos/detect-roots', async (req, reply) => {
-  const { url, github_pat } = req.body // was req.query
+    const { url, github_pat } = req.body
 
     const repo = url.replace('https://github.com/', '').replace(/\/$/, '')
     const github = createGithubClient(github_pat, repo)
@@ -72,13 +72,10 @@ export default async function reposRoutes(fastify) {
         url,
         github_pat: encrypted_pat,
         default_branch: default_branch || 'main',
-
         owner_id,
         index_status: 'pending',
-        file_count: 0
-
-        source_root: source_root || null,
-        owner_id
+        file_count: 0,
+        source_root: source_root || null
       })
       .select()
       .single()
@@ -92,6 +89,11 @@ export default async function reposRoutes(fastify) {
       console.log(`Indexing triggered for ${targetRepo} (root: ${source_root || 'repo root'})`)
     } catch (err) {
       console.error(`Failed to trigger indexing: ${err.message}`)
+      // Return error to frontend so user knows indexing failed
+      return reply.status(500).send({
+        error: 'Repo saved, but indexing failed to start',
+        detail: err.message
+      })
     }
 
     const { github_pat: _, ...safeRepo } = data
@@ -153,7 +155,7 @@ async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {
         ref: 'main',
         inputs: {
           target_repo: targetRepo,
-          repo_id: repoId,
+          repo_id: String(repoId),
           pat_token: userPat,
           source_root: sourceRoot || ''
         }
