@@ -89,6 +89,11 @@ export default async function reposRoutes(fastify) {
       console.log(`Indexing triggered for ${targetRepo} (root: ${source_root || 'repo root'})`)
     } catch (err) {
       console.error(`Failed to trigger indexing: ${err.message}`)
+      // Return error to frontend so user knows indexing failed
+      return reply.status(500).send({
+        error: 'Repo saved, but indexing failed to start',
+        detail: err.message
+      })
     }
 
     const { github_pat: _, ...safeRepo } = data
@@ -150,7 +155,7 @@ async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {
         ref: 'main',
         inputs: {
           target_repo: targetRepo,
-          repo_id: repoId,
+          repo_id: String(repoId),
           pat_token: userPat,
           source_root: sourceRoot || ''
         }
