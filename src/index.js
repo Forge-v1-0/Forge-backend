@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { createClient } from '@supabase/supabase-js'
+import llmConfigPlugin from './plugins/llm-config.js'
 import agentRoutes, { runAgentLoop, runCoderLoop } from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
@@ -35,6 +36,7 @@ fastify.addHook('preHandler', async (req, reply) => {
   req.user = data.user
 })
 
+await fastify.register(llmConfigPlugin)
 await fastify.register(agentRoutes)
 await fastify.register(reposRoutes)
 await fastify.register(settingsRoutes)
