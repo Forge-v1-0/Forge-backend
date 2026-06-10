@@ -12,15 +12,31 @@ export default async function agentRoutes(fastify) {
     timestamp: new Date().toISOString()
   }))
 
-  // ─── LIST SESSIONS ───────────────────────────────────────────────
+    // ─── LIST SESSIONS ───────────────────────────────────────────────
   fastify.get('/agent/sessions', async (req, reply) => {
     const owner_id = req.user.id
     const { repo_id } = req.query
 
+    // 1. Get all repo IDs owned by this user
+    const { data: userRepos, error: repoError } = await supabase
+      .from('repos')
+      .select('id')
+      .eq('owner_id', owner_id)
+
+    if (repoError) {
+      return reply.status(500).send({ error: repoError.message })
+    }
+
+    const repoIds = userRepos?.map(r => r.id) || []
+    if (repoIds.length === 0) {
+      return reply.send({ sessions: [] })
+    }
+
+    // 2. Query sessions that belong to those repos
     let query = supabase
       .from('sessions')
       .select('*, repos(name, url)')
-      .eq('owner_id', owner_id)
+      .in('repo_id', repoIds)
       .order('created_at', { ascending: false })
 
     if (repo_id) {
@@ -28,10 +44,11 @@ export default async function agentRoutes(fastify) {
     }
 
     const { data, error } = await query
+
     if (error) return reply.status(500).send({ error: error.message })
+
     return reply.send({ sessions: data || [] })
   })
-
   // ─── START SESSION ───────────────────────────────────────────────
   fastify.post('/agent/start', async (req, reply) => {
     const { repo_id, task } = req.body
