@@ -15,3 +15,7 @@ services:
         sync: false
       - key: ENCRYPTION_KEY
         sync: false
+      - key: INDEXER_REPO
+        sync: false
+      - key: INDEXER_PAT
+        sync: false
