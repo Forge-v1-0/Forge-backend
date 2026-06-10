@@ -563,13 +563,24 @@ async function run() {
     }
   }
 
+  // ─── DEDUPLICATE EDGES ───────────────────────────────────────────
+  // PostgreSQL upsert fails if the same conflict key appears twice in one batch
+  const edgeKey = (e) => `${e.from_symbol_id}|${e.to_symbol_id}|${e.edge_type}|${e.source_file_id}`
+  const seenEdges = new Set()
+  const dedupedEdges = edgesToInsert.filter(e => {
+    const key = edgeKey(e)
+    if (seenEdges.has(key)) return false
+    seenEdges.add(key)
+    return true
+  })
+
   // Bulk insert edges
-  for (let i = 0; i < edgesToInsert.length; i += 1000) {
-    const chunk = edgesToInsert.slice(i, i + 1000)
+  for (let i = 0; i < dedupedEdges.length; i += 1000) {
+    const chunk = dedupedEdges.slice(i, i + 1000)
     const { error } = await supabase.from('edges').upsert(chunk, { onConflict: 'from_symbol_id,to_symbol_id,edge_type,source_file_id' })
     if (error) { console.error(`❌ Edge batch failed: ${error.message}`); throw error }
   }
-  console.log(`🔗 ${edgesToInsert.length} edges inserted`)
+  console.log(`🔗 ${dedupedEdges.length} edges inserted (${edgesToInsert.length - dedupedEdges.length} duplicates removed)`)
 
   // Refresh deps
   const { error: rpcErr } = await supabase.rpc('refresh_file_deps', { p_repo_id: REPO_ID })
@@ -586,7 +597,7 @@ async function run() {
   }).eq('id', REPO_ID)
 
   const duration = ((Date.now() - startTime) / 1000).toFixed(1)
-  console.log(`✅ Complete in ${duration}s | Files: ${analyses.size} | Symbols: ${symbolRows.length} | Edges: ${edgesToInsert.length} | Framework: ${detectedFramework}`)
+  console.log(`✅ Complete in ${duration}s | Files: ${analyses.size} | Symbols: ${symbolRows.length} | Edges: ${dedupedEdges.length} | Framework: ${detectedFramework}`)
 }
 
 run().catch(async err => {
