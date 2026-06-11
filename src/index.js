@@ -18,7 +18,7 @@ const supabaseAuth = createClient(
 
 fastify.decorate('supabase', supabase)
 
-// ─── MODEL SANITIZER ─────────────────────────────────────────────
+// ─── MODEL SANITIZER (also used by startup recovery) ──────────────
 const DEAD_MODELS = {
   'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
   'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
@@ -30,7 +30,7 @@ function sanitizeModel(model) {
   return DEAD_MODELS[model] || model
 }
 
-// ─── ROOT DECORATOR (available to all routes) ───────────────────────
+// ─── ROOT DECORATOR: LLM CONFIG ───────────────────────────────────
 fastify.decorate('getUserLLMConfig', async (owner_id) => {
   const { data, error } = await fastify.supabase
     .from('user_settings')
@@ -58,27 +58,35 @@ fastify.decorate('getUserLLMConfig', async (owner_id) => {
   return result
 })
 
-// ─── REPO PAT DECORATOR ─────────────────────────────────────────────
+// ─── REPO PAT DECORATOR (matches your actual schema) ───────────────
 fastify.decorate('getRepoPat', async function (repoId) {
   const supabase = fastify.supabase
 
   const { data, error } = await supabase
     .from('repos')
-    .select('full_name, github_tokens(token)')
+    .select('name, url, github_pat')
     .eq('id', repoId)
     .single()
 
   if (error || !data) {
-    throw new Error(`getRepoPat failed for repoId ${repoId}: ${error?.message || 'No row found'}`)
+    throw new Error(`getRepoPat failed for repoId ${repoId}: ${error?.message || 'Repo not found'}`)
   }
 
-  const pat = data.github_tokens?.token || data.pat || data.token
-  const repo = data.full_name || data.repo_name || data.name
+  if (!data.github_pat) {
+    throw new Error(`No github_pat stored for repoId ${repoId}`)
+  }
 
-  if (!pat) throw new Error(`No PAT stored for repoId ${repoId}`)
-  if (!repo) throw new Error(`No repo full_name stored for repoId ${repoId}`)
+  // Derive "owner/repo" from the URL if possible, fallback to raw name
+  let repo = data.name
+  try {
+    const url = new URL(data.url)
+    const path = url.pathname.replace(/^\/+/, '').replace(/\.git$/, '')
+    if (path.includes('/')) repo = path
+  } catch (e) {
+    // URL malformed, use raw name
+  }
 
-  return { pat, repo }
+  return { pat: data.github_pat, repo }
 })
 
 await fastify.register(cors, {
