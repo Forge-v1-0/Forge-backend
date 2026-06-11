@@ -11,16 +11,9 @@ export function createGithubClient(pat, repo) {
 
   const base = `https://api.github.com/repos/${repo}`
 
-  // Native fetch with AbortController timeout
-  async function fetchGitHub(url, options = {}, timeoutMs = 30000) {
-    const controller = new AbortController()
-    const id = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-      const res = await fetch(url, { ...options, headers, signal: controller.signal })
-      return res
-    } finally {
-      clearTimeout(id)
-    }
+  async function fetchGitHub(url, options = {}) {
+    const res = await fetch(url, { ...options, headers })
+    return res
   }
 
   async function getDefaultBranch() {
@@ -30,16 +23,18 @@ export function createGithubClient(pat, repo) {
       throw new Error(`GitHub getDefaultBranch ${res.status}: ${JSON.stringify(err)}`)
     }
     const data = await res.json()
-    if (!data.default_branch) throw new Error('GitHub response missing default_branch')
     return data.default_branch
   }
 
-  // Returns null ONLY for 404 (new file). Throws on 401/403/500 so the agent can see real errors.
+  // Returns null ONLY for 404 (new file). Throws on 401/403/500.
   async function getFileContent(path) {
     const cleanPath = (path || '').replace(/^\/+/, '')
     const res = await fetchGitHub(`${base}/contents/${cleanPath}`)
 
     if (res.status === 404) return null
+    if (res.status === 401) {
+      throw new Error(`GitHub PAT is invalid (401). Please update your GitHub token in settings.`)
+    }
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
       throw new Error(`GitHub getFileContent ${res.status} for ${cleanPath}: ${JSON.stringify(err)}`)
@@ -102,7 +97,7 @@ export function createGithubClient(pat, repo) {
       body: JSON.stringify({ ref: `refs/heads/${branchName}`, sha })
     })
 
-    // 422 = already exists (safe to ignore)
+    // 422 = branch already exists (safe to ignore)
     if (!res.ok && res.status !== 422) {
       const err = await res.json().catch(() => ({}))
       throw new Error(`GitHub createBranch ${res.status}: ${JSON.stringify(err)}`)
