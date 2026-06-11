@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { createClient } from '@supabase/supabase-js'
+import { decrypt } from './services/crypto.js'
 import agentRoutes, { runAgentLoop, runCoderLoop } from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
@@ -16,6 +17,46 @@ const supabaseAuth = createClient(
 )
 
 fastify.decorate('supabase', supabase)
+
+// ─── MODEL SANITIZER ─────────────────────────────────────────────
+const DEAD_MODELS = {
+  'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
+  'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
+  'poolside/laguna-m.1:free': 'meta-llama/llama-4-maverick:free'
+}
+
+function sanitizeModel(model) {
+  if (!model) return 'meta-llama/llama-4-maverick:free'
+  return DEAD_MODELS[model] || model
+}
+
+// ─── ROOT DECORATOR (available to all routes) ───────────────────────
+fastify.decorate('getUserLLMConfig', async (owner_id) => {
+  const { data, error } = await fastify.supabase
+    .from('user_settings')
+    .select('openrouter_api_key, planner_model, coder_model')
+    .eq('owner_id', owner_id)
+    .single()
+
+  console.log('DEBUG getUserLLMConfig raw DB:', { owner_id, planner_model: data?.planner_model, coder_model: data?.coder_model })
+
+  if (error || !data) {
+    throw new Error('No settings found. Please add your OpenRouter API key in settings.')
+  }
+
+  if (!data.openrouter_api_key) {
+    throw new Error('OpenRouter API key not set. Please add it in settings.')
+  }
+
+  const result = {
+    apiKey: decrypt(data.openrouter_api_key),
+    plannerModel: sanitizeModel(data.planner_model),
+    coderModel: sanitizeModel(data.coder_model)
+  }
+
+  console.log('DEBUG getUserLLMConfig sanitized:', result)
+  return result
+})
 
 await fastify.register(cors, {
   origin: process.env.FRONTEND_URL || '*'
@@ -89,7 +130,6 @@ try {
   await fastify.listen({ port, host: '0.0.0.0' })
   console.log(`Agent server running on port ${port}`)
   
-  // Run recovery after server is up and ready
   recoverStuckSessions()
 } catch (err) {
   fastify.log.error(err)

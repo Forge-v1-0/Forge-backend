@@ -4,6 +4,18 @@ import { runPlanner, replanSubtask, generateExplanation } from '../services/plan
 import { runCoder } from '../services/coder.js'
 import { createGithubClient } from '../services/github.js'
 
+// ─── MODEL SANITIZER ─────────────────────────────────────────────
+const DEAD_MODELS = {
+  'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
+  'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
+  'poolside/laguna-m.1:free': 'meta-llama/llama-4-maverick:free'
+}
+
+function sanitizeModel(model) {
+  if (!model) return 'meta-llama/llama-4-maverick:free'
+  return DEAD_MODELS[model] || model
+}
+
 export default async function agentRoutes(fastify) {
   const supabase = fastify.supabase
 
@@ -12,12 +24,11 @@ export default async function agentRoutes(fastify) {
     timestamp: new Date().toISOString()
   }))
 
-    // ─── LIST SESSIONS ───────────────────────────────────────────────
+  // ─── LIST SESSIONS ───────────────────────────────────────────────
   fastify.get('/agent/sessions', async (req, reply) => {
     const owner_id = req.user.id
     const { repo_id } = req.query
 
-    // 1. Get all repo IDs owned by this user
     const { data: userRepos, error: repoError } = await supabase
       .from('repos')
       .select('id')
@@ -32,7 +43,6 @@ export default async function agentRoutes(fastify) {
       return reply.send({ sessions: [] })
     }
 
-    // 2. Query sessions that belong to those repos
     let query = supabase
       .from('sessions')
       .select('*, repos(name, url)')
@@ -49,10 +59,13 @@ export default async function agentRoutes(fastify) {
 
     return reply.send({ sessions: data || [] })
   })
+
   // ─── START SESSION ───────────────────────────────────────────────
   fastify.post('/agent/start', async (req, reply) => {
-    const { repo_id, task } = req.body
+    const { repo_id, task, plannerModel, coderModel } = req.body
     const owner_id = req.user.id
+
+    console.log('DEBUG /agent/start body:', { repo_id, task, plannerModel, coderModel })
 
     if (!repo_id || !task) {
       return reply.status(400).send({ error: 'Missing repo_id or task' })
@@ -74,7 +87,9 @@ export default async function agentRoutes(fastify) {
       sessionId: session.id,
       repoId: repo_id,
       ownerId: owner_id,
-      task
+      task,
+      plannerModel,
+      coderModel
     }).catch(async (err) => {
       console.error(`Agent loop failed for session ${session.id}:`, err.message)
       await supabase
@@ -187,7 +202,7 @@ export default async function agentRoutes(fastify) {
     })
 
     let attempts = 0
-    const maxAttempts = 120 // 4 minutes max
+    const maxAttempts = 120
 
     while (attempts < maxAttempts) {
       const { data: session } = await supabase
@@ -244,7 +259,7 @@ export default async function agentRoutes(fastify) {
     })
 
     let attempts = 0
-    const maxAttempts = 120 // 4 minutes max
+    const maxAttempts = 120
 
     while (attempts < maxAttempts) {
       const { data: drafts } = await supabase
@@ -271,7 +286,6 @@ export default async function agentRoutes(fastify) {
         return reply
       }
 
-      // Check if task failed
       const { data: task } = await supabase
         .from('tasks')
         .select('status')
@@ -410,14 +424,20 @@ export async function runAgentLoop({
   sessionId,
   repoId,
   ownerId,
-  task
+  task,
+  plannerModel: passedPlannerModel,
+  coderModel: passedCoderModel
 }) {
-  const { apiKey, plannerModel, coderModel } = await fastify.getUserLLMConfig(ownerId)
+  const config = await fastify.getUserLLMConfig(ownerId)
+  const plannerModel = sanitizeModel(passedPlannerModel || config.plannerModel)
+  const coderModel = sanitizeModel(passedCoderModel || config.coderModel)
+
+  console.log('DEBUG runAgentLoop models:', { plannerModel, coderModel })
 
   const context = await buildContext(supabase, repoId)
   const memory = await loadMemory(supabase, repoId)
 
-  const plan = await runPlanner({ task, context, memory, plannerModel, apiKey })
+  const plan = await runPlanner({ task, context, memory, plannerModel, apiKey: config.apiKey })
 
   for (const subtask of plan.subtasks) {
     await supabase.from('tasks').insert({
@@ -433,7 +453,12 @@ export async function runAgentLoop({
     .from('sessions')
     .update({
       status: 'plan_review',
-      plan: { analysis: plan.analysis, subtasks: plan.subtasks }
+      plan: {
+        analysis: plan.analysis,
+        subtasks: plan.subtasks,
+        plannerModel,
+        coderModel
+      }
     })
     .eq('id', sessionId)
 }
@@ -446,7 +471,20 @@ export async function runCoderLoop({
   repoId,
   ownerId
 }) {
-  const { apiKey, plannerModel, coderModel } = await fastify.getUserLLMConfig(ownerId)
+  const { data: session } = await supabase
+    .from('sessions')
+    .select('plan')
+    .eq('id', sessionId)
+    .single()
+
+  const planModels = session?.plan || {}
+  const config = await fastify.getUserLLMConfig(ownerId)
+
+  const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
+  const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+  const apiKey = config.apiKey
+
+  console.log('DEBUG runCoderLoop models:', { plannerModel, coderModel })
 
   await supabase
     .from('tasks')
@@ -471,12 +509,6 @@ export async function runCoderLoop({
   const { pat, repo } = await fastify.getRepoPat(repoId)
   const github = createGithubClient(pat, repo)
 
-  const { data: session } = await supabase
-    .from('sessions')
-    .select('plan')
-    .eq('id', sessionId)
-    .single()
-
   const subtaskMap = {}
   for (const s of (session?.plan?.subtasks || [])) {
     subtaskMap[s.file_path] = s
@@ -486,9 +518,7 @@ export async function runCoderLoop({
     await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
 
     const language = await getFileLanguage(supabase, repoId, task.file_path)
-
     const currentContent = await github.getFileContent(task.file_path)
-
     const subtaskMeta = subtaskMap[task.file_path] || {}
 
     const newContent = await runCoder({
@@ -537,7 +567,21 @@ async function runFeedbackLoop({
   ownerId,
   originalTask
 }) {
-  const { apiKey, plannerModel, coderModel } = await fastify.getUserLLMConfig(ownerId)
+  const { data: session } = await supabase
+    .from('sessions')
+    .select('plan')
+    .eq('id', sessionId)
+    .single()
+
+  const planModels = session?.plan || {}
+  const config = await fastify.getUserLLMConfig(ownerId)
+
+  const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
+  const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+  const apiKey = config.apiKey
+
+  console.log('DEBUG runFeedbackLoop models:', { plannerModel, coderModel })
+
   const context = await buildContext(supabase, repoId)
   const memory = await loadMemory(supabase, repoId, [draft.file_path])
 
