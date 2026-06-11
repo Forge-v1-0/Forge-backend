@@ -4,7 +4,7 @@ import { runPlanner, replanSubtask, generateExplanation } from '../services/plan
 import { runCoder } from '../services/coder.js'
 import { createGithubClient } from '../services/github.js'
 
-// ─── MODEL SANITIZER ─────────────────────────────────────────────
+// ─── UTILS ───────────────────────────────────────────────────────
 const DEAD_MODELS = {
   'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
   'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
@@ -14,6 +14,10 @@ const DEAD_MODELS = {
 function sanitizeModel(model) {
   if (!model) return 'meta-llama/llama-4-maverick:free'
   return DEAD_MODELS[model] || model
+}
+
+function normalizePath(p) {
+  return (p || '').replace(/^\/+/, '')
 }
 
 export default async function agentRoutes(fastify) {
@@ -91,7 +95,7 @@ export default async function agentRoutes(fastify) {
       plannerModel,
       coderModel
     }).catch(async (err) => {
-      console.error(`Agent loop failed for session ${session.id}:`, err.message)
+      console.error(`Agent loop failed for session ${session.id}:`, err)
       await supabase
         .from('sessions')
         .update({ status: 'failed' })
@@ -133,7 +137,7 @@ export default async function agentRoutes(fastify) {
       repoId: session.repo_id,
       ownerId: repo.owner_id
     }).catch(async (err) => {
-      console.error(`Coder loop failed:`, err.message)
+      console.error(`Coder loop failed (handler catch):`, err)
       await supabase.from('sessions').update({ status: 'failed' }).eq('id', session_id)
     })
 
@@ -164,7 +168,7 @@ export default async function agentRoutes(fastify) {
         session_id,
         type: 'WRITE',
         instruction: subtask.instruction,
-        file_path: subtask.file_path,
+        file_path: normalizePath(subtask.file_path),
         status: 'pending'
       })
     }
@@ -218,9 +222,10 @@ export default async function agentRoutes(fastify) {
       }
 
       if (session.status === 'plan_review' && session.plan) {
-        const planText = `## Analysis\n\n${session.plan.analysis}\n\n## Subtasks\n\n` +
-          session.plan.subtasks.map((s, i) =>
-            `${i + 1}. **${s.file_path}** (${s.risk} risk)\n   ${s.instruction}${s.risk_reason ? '\n   ⚠️ ' + s.risk_reason : ''}`
+        const subtasks = session.plan.subtasks || []
+        const planText = `## Analysis\n\n${session.plan.analysis || ''}\n\n## Subtasks\n\n` +
+          subtasks.map((s, i) =>
+            `${i + 1}. **${s.file_path}** (${s.risk || 'unknown'} risk)\n   ${s.instruction}${s.risk_reason ? '\n   ⚠️ ' + s.risk_reason : ''}`
           ).join('\n\n')
 
         const chunks = planText.match(/.{1,20}/g) || []
@@ -331,23 +336,26 @@ export default async function agentRoutes(fastify) {
     }
 
     const repoId = session.repo_id
+    const filePath = normalizePath(draft.file_path)
 
     const { pat, repo } = await fastify.getRepoPat(repoId)
+    if (!pat || !repo) {
+      return reply.status(500).send({ error: 'Missing PAT or repo identifier' })
+    }
     const github = createGithubClient(pat, repo)
 
     const branchName = `agent/${session.id}`
     try {
       await github.createBranch(branchName)
     } catch (err) {
-      const msg = err.message || ''
-      // Ignore "already exists" so multiple drafts in one session can stack on the same branch
+      const msg = err?.message || ''
       if (!msg.includes('already exists') && !msg.includes('Reference already exists')) {
         throw err
       }
     }
 
     await github.pushFile(
-      draft.file_path,
+      filePath,
       draft.new_content,
       `agent: ${task?.instruction?.slice(0, 72) || 'update'}`,
       branchName
@@ -360,8 +368,8 @@ export default async function agentRoutes(fastify) {
       repoId,
       sessionId: session.id,
       type: 'decision',
-      filePath: draft.file_path,
-      summary: `Modified ${draft.file_path}. Task: ${task?.instruction?.slice(0, 100) || 'update'}. Human approved.`,
+      filePath,
+      summary: `Modified ${filePath}. Task: ${task?.instruction?.slice(0, 100) || 'update'}. Human approved.`,
       detail: { explanation: draft.explanation }
     })
 
@@ -375,7 +383,7 @@ export default async function agentRoutes(fastify) {
       await supabase.from('sessions').update({ status: 'done' }).eq('id', session.id)
     }
 
-    const githubUrl = `https://github.com/${repo}/blob/${branchName}/${draft.file_path}`
+    const githubUrl = `https://github.com/${repo}/blob/${branchName}/${filePath}`
     return reply.send({ ok: true, branch: branchName, github_url: githubUrl })
   })
 
@@ -407,7 +415,7 @@ export default async function agentRoutes(fastify) {
       repoId,
       sessionId: session.id,
       type: 'rejection',
-      filePath: draft.file_path,
+      filePath: normalizePath(draft.file_path),
       summary: `Draft rejected for ${draft.file_path}. Feedback: "${feedback}"`,
       detail: { feedback, failed_code: draft.new_content }
     })
@@ -422,7 +430,7 @@ export default async function agentRoutes(fastify) {
       ownerId: owner_id,
       originalTask: session.task
     }).catch(async (err) => {
-      console.error(`Feedback loop failed for draft ${draft_id}:`, err.message)
+      console.error(`Feedback loop failed for draft ${draft_id}:`, err)
       await supabase.from('tasks').update({ status: 'failed' }).eq('id', draft.task_id)
     })
 
@@ -457,11 +465,15 @@ export async function runAgentLoop({
   }
 
   for (const subtask of plan.subtasks) {
+    if (!subtask.file_path || !subtask.instruction) {
+      console.warn('DEBUG runAgentLoop skipping invalid subtask:', subtask)
+      continue
+    }
     await supabase.from('tasks').insert({
       session_id: sessionId,
       type: 'WRITE',
       instruction: subtask.instruction,
-      file_path: subtask.file_path,
+      file_path: normalizePath(subtask.file_path),
       status: 'pending'
     })
   }
@@ -490,115 +502,152 @@ export async function runCoderLoop({
 }) {
   console.log('DEBUG runCoderLoop START:', { sessionId, repoId, ownerId })
 
-  const { data: session } = await supabase
-    .from('sessions')
-    .select('plan')
-    .eq('id', sessionId)
-    .single()
+  try {
+    const { data: session } = await supabase
+      .from('sessions')
+      .select('plan')
+      .eq('id', sessionId)
+      .single()
 
-  const planModels = session?.plan || {}
-  const config = await fastify.getUserLLMConfig(ownerId)
+    const planModels = session?.plan || {}
+    const config = await fastify.getUserLLMConfig(ownerId)
 
-  const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
-  const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
-  const apiKey = config.apiKey
-
-  console.log('DEBUG runCoderLoop models:', { plannerModel, coderModel })
-
-  // Recover any tasks that were left hanging in 'running' from a crashed previous loop
-  await supabase
-    .from('tasks')
-    .update({ status: 'pending' })
-    .eq('session_id', sessionId)
-    .eq('status', 'running')
-
-  const { data: tasks } = await supabase
-    .from('tasks')
-    .select('*')
-    .eq('session_id', sessionId)
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true })
-
-  console.log('DEBUG runCoderLoop tasks:', { count: tasks?.length || 0 })
-
-  if (!tasks || tasks.length === 0) {
-    console.log('DEBUG runCoderLoop: no pending tasks, marking done')
-    await supabase.from('sessions').update({ status: 'done' }).eq('id', sessionId)
-    return
-  }
-
-  await supabase.from('sessions').update({ status: 'coding' }).eq('id', sessionId)
-
-  const { pat, repo } = await fastify.getRepoPat(repoId)
-  const github = createGithubClient(pat, repo)
-
-  // Map planner subtasks by file_path so the coder receives risk metadata
-  const subtaskMap = {}
-  for (const s of (session?.plan?.subtasks || [])) {
-    subtaskMap[s.file_path] = s
-  }
-
-  let successCount = 0
-  let failCount = 0
-
-  for (const task of tasks) {
-    try {
-      console.log('DEBUG runCoderLoop processing task:', { id: task.id, file: task.file_path })
-      await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
-
-      const language = await getFileLanguage(supabase, repoId, task.file_path)
-      const currentContent = await github.getFileContent(task.file_path)
-
-      // If the file doesn't exist on the default branch yet (new file), feed the coder an empty string
-      const fileContent = currentContent === null ? '' : currentContent
-
-      const subtaskMeta = subtaskMap[task.file_path] || {}
-
-      const newContent = await runCoder({
-        filePath: task.file_path,
-        language,
-        currentContent: fileContent,
-        instruction: task.instruction,
-        risk: subtaskMeta.risk,
-        riskReason: subtaskMeta.risk_reason,
-        coderModel,
-        apiKey
-      })
-
-      const explanation = await generateExplanation({
-        instruction: task.instruction,
-        originalContent: fileContent,
-        newContent,
-        plannerModel,
-        apiKey
-      })
-
-      await supabase.from('code_drafts').insert({
-        session_id: sessionId,
-        task_id: task.id,
-        file_path: task.file_path,
-        original_content: fileContent,
-        new_content: newContent,
-        explanation,
-        verdict: 'awaiting_approval'
-      })
-
-      await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', task.id)
-      successCount++
-      console.log('DEBUG runCoderLoop task SUCCESS:', { id: task.id })
-    } catch (err) {
-      console.error('DEBUG runCoderLoop task FAILED:', { id: task.id, file: task.file_path, error: err.message })
-      await supabase.from('tasks').update({ status: 'failed', error: err.message }).eq('id', task.id)
-      failCount++
+    if (!config || !config.apiKey) {
+      throw new Error(`Missing LLM config for owner ${ownerId}`)
     }
-  }
 
-  console.log('DEBUG runCoderLoop DONE:', { successCount, failCount })
+    const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
+    const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+    const apiKey = config.apiKey
 
-  if (successCount > 0) {
-    await supabase.from('sessions').update({ status: 'awaiting_approval' }).eq('id', sessionId)
-  } else {
+    console.log('DEBUG runCoderLoop models:', { plannerModel, coderModel })
+
+    // Recover any tasks that were left hanging in 'running' from a crashed previous loop
+    await supabase
+      .from('tasks')
+      .update({ status: 'pending' })
+      .eq('session_id', sessionId)
+      .eq('status', 'running')
+
+    const { data: tasks } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+
+    console.log('DEBUG runCoderLoop tasks:', { count: tasks?.length || 0 })
+
+    if (!tasks || tasks.length === 0) {
+      console.log('DEBUG runCoderLoop: no pending tasks, marking done')
+      await supabase.from('sessions').update({ status: 'done' }).eq('id', sessionId)
+      return
+    }
+
+    await supabase.from('sessions').update({ status: 'coding' }).eq('id', sessionId)
+
+    const { pat, repo } = await fastify.getRepoPat(repoId)
+    if (!pat || !repo) {
+      throw new Error(`Missing PAT or repo identifier for repoId ${repoId}`)
+    }
+    const github = createGithubClient(pat, repo)
+
+    // Map planner subtasks by file_path so the coder receives risk metadata
+    const subtaskMap = {}
+    for (const s of (session?.plan?.subtasks || [])) {
+      if (s.file_path) subtaskMap[normalizePath(s.file_path)] = s
+    }
+
+    let successCount = 0
+    let failCount = 0
+
+    for (const task of tasks) {
+      try {
+        if (!task.file_path) {
+          throw new Error(`Task ${task.id} is missing file_path`)
+        }
+
+        const filePath = normalizePath(task.file_path)
+        console.log('DEBUG runCoderLoop processing task:', { id: task.id, file: filePath })
+
+        await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
+
+        let language = await getFileLanguage(supabase, repoId, filePath)
+        if (!language) language = 'text'
+
+        let currentContent
+        try {
+          currentContent = await github.getFileContent(filePath)
+        } catch (fileErr) {
+          const msg = fileErr?.message || String(fileErr)
+          if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
+            console.log('DEBUG runCoderLoop file not found on GitHub, treating as new:', filePath)
+            currentContent = null
+          } else {
+            throw fileErr
+          }
+        }
+
+        const fileContent = currentContent == null ? '' : currentContent
+        const subtaskMeta = subtaskMap[filePath] || {}
+
+        const newContent = await runCoder({
+          filePath,
+          language,
+          currentContent: fileContent,
+          instruction: task.instruction,
+          risk: subtaskMeta.risk,
+          riskReason: subtaskMeta.risk_reason,
+          coderModel,
+          apiKey
+        })
+
+        const explanation = await generateExplanation({
+          instruction: task.instruction,
+          originalContent: fileContent,
+          newContent,
+          plannerModel,
+          apiKey
+        })
+
+        await supabase.from('code_drafts').insert({
+          session_id: sessionId,
+          task_id: task.id,
+          file_path: filePath,
+          original_content: fileContent,
+          new_content: newContent,
+          explanation,
+          verdict: 'awaiting_approval'
+        })
+
+        await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', task.id)
+        successCount++
+        console.log('DEBUG runCoderLoop task SUCCESS:', { id: task.id })
+      } catch (err) {
+        console.error('DEBUG runCoderLoop task FAILED:', { id: task.id, file: task.file_path, error: err?.message || err })
+        await supabase.from('tasks').update({ status: 'failed', error: err?.message || 'Unknown error' }).eq('id', task.id)
+        failCount++
+      }
+    }
+
+    console.log('DEBUG runCoderLoop DONE:', { successCount, failCount })
+
+    if (successCount > 0) {
+      await supabase.from('sessions').update({ status: 'awaiting_approval' }).eq('id', sessionId)
+    } else {
+      await supabase.from('sessions').update({ status: 'failed' }).eq('id', sessionId)
+    }
+  } catch (outerErr) {
+    console.error('DEBUG runCoderLoop FATAL:', outerErr)
+    // Fail every task that is still pending or running so nothing is left dangling
+    await supabase
+      .from('tasks')
+      .update({ status: 'failed', error: outerErr?.message || 'Loop-level failure' })
+      .eq('session_id', sessionId)
+      .in('status', ['pending', 'running'])
+
     await supabase.from('sessions').update({ status: 'failed' }).eq('id', sessionId)
+    throw outerErr
   }
 }
 
@@ -613,82 +662,110 @@ async function runFeedbackLoop({
   ownerId,
   originalTask
 }) {
-  const { data: session } = await supabase
-    .from('sessions')
-    .select('plan')
-    .eq('id', sessionId)
-    .single()
+  try {
+    const { data: session } = await supabase
+      .from('sessions')
+      .select('plan')
+      .eq('id', sessionId)
+      .single()
 
-  const planModels = session?.plan || {}
-  const config = await fastify.getUserLLMConfig(ownerId)
+    const planModels = session?.plan || {}
+    const config = await fastify.getUserLLMConfig(ownerId)
 
-  const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
-  const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
-  const apiKey = config.apiKey
+    if (!config || !config.apiKey) {
+      throw new Error(`Missing LLM config for owner ${ownerId}`)
+    }
 
-  console.log('DEBUG runFeedbackLoop models:', { plannerModel, coderModel })
+    const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
+    const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+    const apiKey = config.apiKey
 
-  const context = await buildContext(supabase, repoId)
-  const memory = await loadMemory(supabase, repoId, [draft.file_path])
+    console.log('DEBUG runFeedbackLoop models:', { plannerModel, coderModel })
 
-  const replan = await replanSubtask({
-    originalTask,
-    originalInstruction: draft.tasks.instruction,
-    failedCode: draft.new_content,
-    feedback,
-    context,
-    memory,
-    plannerModel,
-    apiKey
-  })
+    const context = await buildContext(supabase, repoId)
+    const memory = await loadMemory(supabase, repoId, [normalizePath(draft.file_path)])
 
-  await supabase
-    .from('tasks')
-    .update({
-      instruction: replan.subtask.instruction,
-      status: 'running',
-      retries: (draft.tasks.retries || 0) + 1
+    const replan = await replanSubtask({
+      originalTask,
+      originalInstruction: draft.tasks?.instruction,
+      failedCode: draft.new_content,
+      feedback,
+      context,
+      memory,
+      plannerModel,
+      apiKey
     })
-    .eq('id', draft.task_id)
 
-  const language = await getFileLanguage(supabase, repoId, draft.file_path)
+    await supabase
+      .from('tasks')
+      .update({
+        instruction: replan.subtask.instruction,
+        status: 'running',
+        retries: (draft.tasks?.retries || 0) + 1
+      })
+      .eq('id', draft.task_id)
 
-  const { pat, repo } = await fastify.getRepoPat(repoId)
-  const github = createGithubClient(pat, repo)
-  const currentContent = await github.getFileContent(draft.file_path)
+    const filePath = normalizePath(draft.file_path)
+    let language = await getFileLanguage(supabase, repoId, filePath)
+    if (!language) language = 'text'
 
-  // Allow null for new files that don't exist yet on the default branch
-  const fileContent = currentContent === null ? '' : currentContent
+    const { pat, repo } = await fastify.getRepoPat(repoId)
+    if (!pat || !repo) {
+      throw new Error(`Missing PAT or repo identifier for repoId ${repoId}`)
+    }
+    const github = createGithubClient(pat, repo)
 
-  const newContent = await runCoder({
-    filePath: draft.file_path,
-    language,
-    currentContent: fileContent,
-    instruction: replan.subtask.instruction,
-    risk: replan.subtask.risk,
-    riskReason: replan.subtask.risk_reason,
-    feedback,
-    coderModel,
-    apiKey
-  })
+    let currentContent
+    try {
+      currentContent = await github.getFileContent(filePath)
+    } catch (fileErr) {
+      const msg = fileErr?.message || String(fileErr)
+      if (msg.includes('404') || msg.includes('Not Found') || msg.includes('not found')) {
+        currentContent = null
+      } else {
+        throw fileErr
+      }
+    }
 
-  const explanation = await generateExplanation({
-    instruction: replan.subtask.instruction,
-    originalContent: fileContent,
-    newContent,
-    plannerModel,
-    apiKey
-  })
+    const fileContent = currentContent == null ? '' : currentContent
 
-  await supabase.from('code_drafts').insert({
-    session_id: sessionId,
-    task_id: draft.task_id,
-    file_path: draft.file_path,
-    original_content: fileContent,
-    new_content: newContent,
-    explanation,
-    verdict: 'awaiting_approval'
-  })
+    const newContent = await runCoder({
+      filePath,
+      language,
+      currentContent: fileContent,
+      instruction: replan.subtask.instruction,
+      risk: replan.subtask.risk,
+      riskReason: replan.subtask.risk_reason,
+      feedback,
+      coderModel,
+      apiKey
+    })
 
-  await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', draft.task_id)
+    const explanation = await generateExplanation({
+      instruction: replan.subtask.instruction,
+      originalContent: fileContent,
+      newContent,
+      plannerModel,
+      apiKey
+    })
+
+    await supabase.from('code_drafts').insert({
+      session_id: sessionId,
+      task_id: draft.task_id,
+      file_path: filePath,
+      original_content: fileContent,
+      new_content: newContent,
+      explanation,
+      verdict: 'awaiting_approval'
+    })
+
+    await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', draft.task_id)
+  } catch (outerErr) {
+    console.error('DEBUG runFeedbackLoop FATAL:', outerErr)
+    await supabase
+      .from('tasks')
+      .update({ status: 'failed', error: outerErr?.message || 'Feedback loop failure' })
+      .eq('id', draft.task_id)
+    throw outerErr
+  }
 }
