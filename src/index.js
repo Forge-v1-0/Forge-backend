@@ -58,6 +58,29 @@ fastify.decorate('getUserLLMConfig', async (owner_id) => {
   return result
 })
 
+// ─── REPO PAT DECORATOR ─────────────────────────────────────────────
+fastify.decorate('getRepoPat', async function (repoId) {
+  const supabase = fastify.supabase
+
+  const { data, error } = await supabase
+    .from('repos')
+    .select('full_name, github_tokens(token)')
+    .eq('id', repoId)
+    .single()
+
+  if (error || !data) {
+    throw new Error(`getRepoPat failed for repoId ${repoId}: ${error?.message || 'No row found'}`)
+  }
+
+  const pat = data.github_tokens?.token || data.pat || data.token
+  const repo = data.full_name || data.repo_name || data.name
+
+  if (!pat) throw new Error(`No PAT stored for repoId ${repoId}`)
+  if (!repo) throw new Error(`No repo full_name stored for repoId ${repoId}`)
+
+  return { pat, repo }
+})
+
 await fastify.register(cors, {
   origin: process.env.FRONTEND_URL || '*'
 })
