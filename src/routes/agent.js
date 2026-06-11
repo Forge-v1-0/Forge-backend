@@ -4,15 +4,16 @@ import { runPlanner, replanSubtask, generateExplanation } from '../services/plan
 import { runCoder } from '../services/coder.js'
 import { createGithubClient } from '../services/github.js'
 
-// ─── UTILS ───────────────────────────────────────────────────────
+// ─── MODEL SANITIZER ─────────────────────────────────────────────
 const DEAD_MODELS = {
-  'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
-  'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
-  'poolside/laguna-m.1:free': 'meta-llama/llama-4-maverick:free'
+  'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick',
+  'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick',
+  'poolside/laguna-m.1:free': 'meta-llama/llama-4-maverick',
+  'meta-llama/llama-4-maverick:free': 'meta-llama/llama-4-maverick'
 }
 
 function sanitizeModel(model) {
-  if (!model) return 'meta-llama/llama-4-maverick:free'
+  if (!model) return 'meta-llama/llama-4-maverick'
   return DEAD_MODELS[model] || model
 }
 
@@ -130,12 +131,17 @@ export default async function agentRoutes(fastify) {
 
     if (!repo) return reply.status(404).send({ error: 'Repo not found' })
 
+    const planModels = session?.plan || {}
+    console.log('DEBUG /agent/approve-plan passing models:', planModels)
+
     runCoderLoop({
       fastify,
       supabase,
       sessionId: session_id,
       repoId: session.repo_id,
-      ownerId: repo.owner_id
+      ownerId: repo.owner_id,
+      plannerModel: planModels.plannerModel,
+      coderModel: planModels.coderModel
     }).catch(async (err) => {
       console.error(`Coder loop failed (handler catch):`, err)
       await supabase.from('sessions').update({ status: 'failed' }).eq('id', session_id)
@@ -408,6 +414,9 @@ export default async function agentRoutes(fastify) {
 
     const session = draft.sessions
     const repoId = session.repo_id
+    const planModels = session?.plan || {}
+
+    console.log('DEBUG /agent/feedback passing models:', planModels)
 
     await supabase.from('code_drafts').update({ verdict: 'revision_requested', feedback }).eq('id', draft_id)
 
@@ -428,7 +437,9 @@ export default async function agentRoutes(fastify) {
       repoId,
       sessionId: session.id,
       ownerId: owner_id,
-      originalTask: session.task
+      originalTask: session.task,
+      plannerModel: planModels.plannerModel,
+      coderModel: planModels.coderModel
     }).catch(async (err) => {
       console.error(`Feedback loop failed for draft ${draft_id}:`, err)
       await supabase.from('tasks').update({ status: 'failed' }).eq('id', draft.task_id)
@@ -449,11 +460,13 @@ export async function runAgentLoop({
   plannerModel: passedPlannerModel,
   coderModel: passedCoderModel
 }) {
+  console.log('DEBUG runAgentLoop START:', { sessionId, passedPlannerModel, passedCoderModel })
+
   const config = await fastify.getUserLLMConfig(ownerId)
   const plannerModel = sanitizeModel(passedPlannerModel || config.plannerModel)
   const coderModel = sanitizeModel(passedCoderModel || config.coderModel)
 
-  console.log('DEBUG runAgentLoop models:', { plannerModel, coderModel })
+  console.log('DEBUG runAgentLoop resolved models:', { plannerModel, coderModel })
 
   const context = await buildContext(supabase, repoId)
   const memory = await loadMemory(supabase, repoId)
@@ -490,6 +503,8 @@ export async function runAgentLoop({
       }
     })
     .eq('id', sessionId)
+
+  console.log('DEBUG runAgentLoop DONE, saved models to plan:', { plannerModel, coderModel })
 }
 
 // ─── BACKGROUND: CODER PHASE ────────────────────────────────────────
@@ -498,9 +513,11 @@ export async function runCoderLoop({
   supabase,
   sessionId,
   repoId,
-  ownerId
+  ownerId,
+  plannerModel: passedPlannerModel,
+  coderModel: passedCoderModel
 }) {
-  console.log('DEBUG runCoderLoop START:', { sessionId, repoId, ownerId })
+  console.log('DEBUG runCoderLoop START:', { sessionId, repoId, ownerId, passedPlannerModel, passedCoderModel })
 
   try {
     const { data: session } = await supabase
@@ -516,11 +533,22 @@ export async function runCoderLoop({
       throw new Error(`Missing LLM config for owner ${ownerId}`)
     }
 
-    const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
-    const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+    const rawPlannerModel = passedPlannerModel || planModels.plannerModel || config.plannerModel
+    const rawCoderModel = passedCoderModel || planModels.coderModel || config.coderModel
+    const plannerModel = sanitizeModel(rawPlannerModel)
+    const coderModel = sanitizeModel(rawCoderModel)
     const apiKey = config.apiKey
 
-    console.log('DEBUG runCoderLoop models:', { plannerModel, coderModel })
+    console.log('DEBUG runCoderLoop model resolution:', {
+      passedPlannerModel,
+      planPlannerModel: planModels.plannerModel,
+      configPlannerModel: config.plannerModel,
+      resolvedPlanner: plannerModel,
+      passedCoderModel,
+      planCoderModel: planModels.coderModel,
+      configCoderModel: config.coderModel,
+      resolvedCoder: coderModel
+    })
 
     // Recover any tasks that were left hanging in 'running' from a crashed previous loop
     await supabase
@@ -568,7 +596,7 @@ export async function runCoderLoop({
         }
 
         const filePath = normalizePath(task.file_path)
-        console.log('DEBUG runCoderLoop processing task:', { id: task.id, file: filePath })
+        console.log('DEBUG runCoderLoop processing task:', { id: task.id, file: filePath, coderModel })
 
         await supabase.from('tasks').update({ status: 'running' }).eq('id', task.id)
 
@@ -622,7 +650,7 @@ export async function runCoderLoop({
 
         await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', task.id)
         successCount++
-        console.log('DEBUG runCoderLoop task SUCCESS:', { id: task.id })
+        console.log('DEBUG runCoderLoop task SUCCESS:', { id: task.id, file: filePath })
       } catch (err) {
         console.error('DEBUG runCoderLoop task FAILED:', { id: task.id, file: task.file_path, error: err?.message || err })
         await supabase.from('tasks').update({ status: 'failed', error: err?.message || 'Unknown error' }).eq('id', task.id)
@@ -660,8 +688,12 @@ async function runFeedbackLoop({
   repoId,
   sessionId,
   ownerId,
-  originalTask
+  originalTask,
+  plannerModel: passedPlannerModel,
+  coderModel: passedCoderModel
 }) {
+  console.log('DEBUG runFeedbackLoop START:', { sessionId, passedPlannerModel, passedCoderModel })
+
   try {
     const { data: session } = await supabase
       .from('sessions')
@@ -676,11 +708,22 @@ async function runFeedbackLoop({
       throw new Error(`Missing LLM config for owner ${ownerId}`)
     }
 
-    const plannerModel = sanitizeModel(planModels.plannerModel || config.plannerModel)
-    const coderModel = sanitizeModel(planModels.coderModel || config.coderModel)
+    const rawPlannerModel = passedPlannerModel || planModels.plannerModel || config.plannerModel
+    const rawCoderModel = passedCoderModel || planModels.coderModel || config.coderModel
+    const plannerModel = sanitizeModel(rawPlannerModel)
+    const coderModel = sanitizeModel(rawCoderModel)
     const apiKey = config.apiKey
 
-    console.log('DEBUG runFeedbackLoop models:', { plannerModel, coderModel })
+    console.log('DEBUG runFeedbackLoop model resolution:', {
+      passedPlannerModel,
+      planPlannerModel: planModels.plannerModel,
+      configPlannerModel: config.plannerModel,
+      resolvedPlanner: plannerModel,
+      passedCoderModel,
+      planCoderModel: planModels.coderModel,
+      configCoderModel: config.coderModel,
+      resolvedCoder: coderModel
+    })
 
     const context = await buildContext(supabase, repoId)
     const memory = await loadMemory(supabase, repoId, [normalizePath(draft.file_path)])
@@ -760,6 +803,7 @@ async function runFeedbackLoop({
     })
 
     await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', draft.task_id)
+    console.log('DEBUG runFeedbackLoop DONE:', { taskId: draft.task_id, filePath, coderModel })
   } catch (outerErr) {
     console.error('DEBUG runFeedbackLoop FATAL:', outerErr)
     await supabase
@@ -769,3 +813,4 @@ async function runFeedbackLoop({
     throw outerErr
   }
 }
+  
