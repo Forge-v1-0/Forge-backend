@@ -51,13 +51,11 @@ When given a task you must:
 
 Respond only with valid JSON. No markdown. No explanation outside the JSON.`
 
-export async function runPlanner({
-  task,
-  context,
-  memory,
-  plannerModel,
-  apiKey
-}) {
+export async function runPlanner({ task, context, memory, plannerModel, apiKey }) {
+  if (!task || !plannerModel || !apiKey) {
+    throw new Error('runPlanner: task, plannerModel, and apiKey are required')
+  }
+
   const userPrompt = `TASK: ${task}
 
 REPO GRAPH:
@@ -87,7 +85,7 @@ Return JSON only:
   ]
 }`
 
-  const result = await callLLMJson(
+  return callLLMJson(
     [
       { role: 'system', content: PLANNER_SYSTEM_PROMPT },
       { role: 'user', content: userPrompt }
@@ -95,8 +93,6 @@ Return JSON only:
     plannerModel,
     apiKey
   )
-
-  return result
 }
 
 export async function replanSubtask({
@@ -109,6 +105,10 @@ export async function replanSubtask({
   plannerModel,
   apiKey
 }) {
+  if (!feedback || !plannerModel || !apiKey) {
+    throw new Error('replanSubtask: feedback, plannerModel, and apiKey are required')
+  }
+
   const userPrompt = `ORIGINAL TASK: ${originalTask}
 
 ORIGINAL INSTRUCTION THAT FAILED:
@@ -143,7 +143,7 @@ Return JSON only:
   }
 }`
 
-  const result = await callLLMJson(
+  return callLLMJson(
     [
       { role: 'system', content: PLANNER_SYSTEM_PROMPT },
       { role: 'user', content: userPrompt }
@@ -151,17 +151,13 @@ Return JSON only:
     plannerModel,
     apiKey
   )
-
-  return result
 }
 
-export async function generateExplanation({
-  instruction,
-  originalContent,
-  newContent,
-  plannerModel,
-  apiKey
-}) {
+export async function generateExplanation({ instruction, originalContent, newContent, plannerModel, apiKey }) {
+  if (!newContent || !plannerModel || !apiKey) {
+    throw new Error('generateExplanation: newContent, plannerModel, and apiKey are required')
+  }
+
   const prompt = `You are a senior engineer explaining a code change to a teammate.
 
 TASK THAT WAS COMPLETED: ${instruction}
@@ -181,9 +177,5 @@ Be specific. Reference function names where relevant.
 Write for a developer who will review and approve this change.
 Maximum 150 words. No markdown.`
 
-  return callLLM(
-    [{ role: 'user', content: prompt }],
-    plannerModel,
-    apiKey
-  )
+  return callLLM([{ role: 'user', content: prompt }], plannerModel, apiKey)
 }

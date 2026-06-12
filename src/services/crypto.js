@@ -1,7 +1,13 @@
 import crypto from 'crypto'
 
+// ─── STARTUP GUARD ────────────────────────────────────────────────
+if (!process.env.ENCRYPTION_KEY || process.env.ENCRYPTION_KEY.length < 16) {
+  console.error('FATAL: ENCRYPTION_KEY env var is missing or shorter than 16 chars. Set it and restart.')
+  process.exit(1)
+}
+
 const ALGORITHM = 'aes-256-cbc'
-const KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY || '').digest()
+const KEY = crypto.createHash('sha256').update(process.env.ENCRYPTION_KEY).digest()
 
 export function encrypt(text) {
   const iv = crypto.randomBytes(16)
@@ -10,7 +16,6 @@ export function encrypt(text) {
     cipher.update(text, 'utf8'),
     cipher.final()
   ])
-  // Store iv + encrypted together so we can decrypt later
   return iv.toString('hex') + ':' + encrypted.toString('hex')
 }
 

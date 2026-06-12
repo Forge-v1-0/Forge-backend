@@ -1,4 +1,4 @@
-import { encrypt, decrypt } from '../services/crypto.js'
+import { encrypt } from '../services/crypto.js'
 import { createGithubClient } from '../services/github.js'
 
 export default async function reposRoutes(fastify) {
@@ -7,21 +7,17 @@ export default async function reposRoutes(fastify) {
   // ─── DETECT SOURCE ROOTS ─────────────────────────────────────────
   fastify.post('/repos/detect-roots', async (req, reply) => {
     const { url, github_pat } = req.body
-
     const repo = url.replace('https://github.com/', '').replace(/\/$/, '')
     const github = createGithubClient(github_pat, repo)
-
     try {
       const tree = await github.getRepoTree()
       const topDirs = tree
         .filter(f => f.type === 'tree' && !f.path.includes('/'))
         .map(f => f.path)
-
       const pkgPaths = tree
         .filter(f => f.path.endsWith('package.json'))
         .map(f => f.path.replace('/package.json', ''))
         .filter(p => p !== '')
-
       return reply.send({
         repo,
         top_level_directories: topDirs,
@@ -36,19 +32,14 @@ export default async function reposRoutes(fastify) {
   fastify.post('/repos', async (req, reply) => {
     const { name, url, github_pat, default_branch, source_root } = req.body
     const owner_id = req.user.id
-
     if (!name || !url || !github_pat) {
       return reply.status(400).send({ error: 'Missing required fields' })
     }
-
-    // Validate GitHub URL format
     if (!url.startsWith('https://github.com/')) {
       return reply.status(400).send({ error: 'URL must be a valid GitHub repository URL' })
     }
-
     const repoPath = url.replace('https://github.com/', '').replace(/\/$/, '')
-
-    // Validate PAT server-side before storing
+    
     try {
       const validateRes = await fetch(`https://api.github.com/repos/${repoPath}`, {
         headers: {
@@ -64,7 +55,6 @@ export default async function reposRoutes(fastify) {
     }
 
     const encrypted_pat = encrypt(github_pat)
-
     const { data, error } = await supabase
       .from('repos')
       .insert({
@@ -83,13 +73,11 @@ export default async function reposRoutes(fastify) {
     if (error) return reply.status(500).send({ error: error.message })
 
     const targetRepo = url.replace('https://github.com/', '').replace(/\/$/, '')
-
     try {
       await triggerIndexWorkflow(targetRepo, data.id, github_pat, source_root)
       console.log(`Indexing triggered for ${targetRepo} (root: ${source_root || 'repo root'})`)
     } catch (err) {
       console.error(`Failed to trigger indexing: ${err.message}`)
-      // Return error to frontend so user knows indexing failed
       return reply.status(500).send({
         error: 'Repo saved, but indexing failed to start',
         detail: err.message
@@ -103,45 +91,22 @@ export default async function reposRoutes(fastify) {
   // ─── LIST REPOS ──────────────────────────────────────────────────
   fastify.get('/repos', async (req, reply) => {
     const owner_id = req.user.id
-
     const { data, error } = await supabase
       .from('repos')
       .select('id, name, url, default_branch, index_status, file_count, source_root, created_at')
       .eq('owner_id', owner_id)
       .order('created_at', { ascending: false })
-
     if (error) return reply.status(500).send({ error: error.message })
-
     return reply.send({ repos: data })
-  })
-
-  // ─── DECORATOR: getRepoPat ───────────────────────────────────────
-  fastify.decorate('getRepoPat', async (repoId) => {
-    const { data, error } = await supabase
-      .from('repos')
-      .select('github_pat, url, source_root')
-      .eq('id', repoId)
-      .single()
-
-    if (error || !data) throw new Error('Repo not found')
-
-    return {
-      pat: decrypt(data.github_pat),
-      url: data.url,
-      repo: data.url.replace('https://github.com/', '').replace(/\/$/, ''),
-      sourceRoot: data.source_root
-    }
   })
 }
 
 async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {
   const indexerRepo = process.env.INDEXER_REPO
   const indexerPat = process.env.INDEXER_PAT
-
   if (!indexerRepo || !indexerPat) {
     throw new Error('INDEXER_REPO or INDEXER_PAT not set')
   }
-
   const res = await fetch(
     `https://api.github.com/repos/${indexerRepo}/actions/workflows/on-demand-index.yml/dispatches`,
     {
@@ -162,7 +127,6 @@ async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {
       })
     }
   )
-
   if (!res.ok) {
     const err = await res.text()
     throw new Error(`Workflow dispatch failed: ${err}`)

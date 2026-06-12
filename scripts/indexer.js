@@ -20,7 +20,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { realtime: { enabled:
 
 // ─── FRAMEWORK DETECTION ───────────────────────────────────────────
 let detectedFramework = 'generic'
-
 async function detectFramework() {
   try {
     const branch = await getDefaultBranch()
@@ -29,7 +28,6 @@ async function detectFramework() {
     const res = await axios.get(url)
     const pkg = res.data
     const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }
-
     if (deps['next']) return 'nextjs'
     if (deps['@nestjs/core'] || deps['@nestjs/common']) return 'nestjs'
     if (deps['vue'] || deps['vue-router'] || deps['nuxt']) return 'vue'
@@ -56,7 +54,6 @@ function detectLanguage(filePath) {
 function getFileRole(filePath, framework) {
   const relativePath = SOURCE_ROOT ? filePath.replace(`${SOURCE_ROOT}/`, '') : filePath
   const base = relativePath.split('/').pop() || ''
-
   switch (framework) {
     case 'nextjs':
     case 'remix':
@@ -68,14 +65,12 @@ function getFileRole(filePath, framework) {
       if (base.startsWith('error.')) return 'error'
       if (base.startsWith('template.')) return 'template'
       return 'none'
-
     case 'express':
     case 'fastify':
       if (relativePath.includes('routes') || relativePath.includes('route')) return 'route'
       if (relativePath.includes('middleware')) return 'middleware'
       if (['app.js','app.ts','server.js','server.ts','index.js','index.ts','main.js','main.ts'].includes(base)) return 'entry_point'
       return 'none'
-
     case 'nestjs':
       if (base.includes('.controller.')) return 'controller'
       if (base.includes('.service.')) return 'service'
@@ -86,7 +81,6 @@ function getFileRole(filePath, framework) {
       if (base.includes('.dto.')) return 'dto'
       if (base.includes('.entity.')) return 'entity'
       return 'none'
-
     case 'vue':
     case 'nuxt':
       if (base.startsWith('page.')) return 'page'
@@ -94,7 +88,6 @@ function getFileRole(filePath, framework) {
       if (base.endsWith('.vue')) return 'component'
       if (relativePath.includes('composables')) return 'composable'
       return 'none'
-
     default:
       return 'none'
   }
@@ -117,14 +110,10 @@ function computeSignature(node) {
   return crypto.createHash('md5').update(node.getText().slice(0, 500)).digest('hex').slice(0, 16)
 }
 
-// ─── PROP EXTRACTION ───────────────────────────────────────────────
 function extractProps(node) {
   const params = node.getParameters()
   if (params.length === 0) return null
-
   const firstParam = params[0]
-
-  // Destructured: ({ variant, size, loading })
   if (Node.isObjectBindingPattern(firstParam)) {
     return firstParam.getElements().map(el => {
       const name = el.getName()
@@ -133,12 +122,9 @@ function extractProps(node) {
       return { name, required: !hasDefault, hasDefault }
     })
   }
-
-  // Props object: (props) => ...
   if (Node.isIdentifier(firstParam)) {
     return [{ name: firstParam.getText(), required: false, isPropsObject: true }]
   }
-
   return null
 }
 
@@ -171,14 +157,11 @@ async function getRepoFiles() {
   const res = await axios.get(url, {
     headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
   })
-
   let files = res.data.tree.filter(f => f.type === 'blob')
-
   if (SOURCE_ROOT) {
     const prefix = SOURCE_ROOT + '/'
     files = files.filter(f => f.path.startsWith(prefix))
   }
-
   return files
 }
 
@@ -189,216 +172,201 @@ async function getFile(filePath) {
   return res.data
 }
 
-// ─── UNIVERSAL ANALYZER ────────────────────────────────────────────
-function analyzeFile(filePath, code, language, framework) {
-  const project = new Project({ useInMemoryFileSystem: true, compilerOptions: { allowJs: true, jsx: 2 } })
-  const source = project.createSourceFile(filePath, code, { overwrite: true })
-
-  const analysis = {
-    imports: [],
-    symbols: [],
-    localEdges: [],
-    routes: [],
-    fileRole: getFileRole(filePath, framework),
-    framework,
-    metadata: {}
-  }
-
-  switch (framework) {
-    case 'nextjs':
-      analysis.metadata.isClientComponent = /^\s*['"]use client['"]/.test(source.getFullText())
-      analysis.metadata.isServerComponent = /^\s*['"]use server['"]/.test(source.getFullText())
-      break
-    case 'express':
-    case 'fastify':
-      analysis.metadata.isEntryPoint = ['app.js','app.ts','server.js','server.ts','index.js','index.ts'].includes(filePath.split('/').pop())
-      break
-  }
-
-  // ── Imports ──
-  for (const imp of source.getImportDeclarations()) {
-    const moduleSpecifier = imp.getModuleSpecifierValue()
-    const bindings = []
-    const defaultImport = imp.getDefaultImport()
-    if (defaultImport) bindings.push({ localName: defaultImport.getText(), importedName: 'default', isDefault: true })
-    for (const named of imp.getNamedImports()) bindings.push({ localName: named.getName(), importedName: named.getName(), isDefault: false })
-    const ns = imp.getNamespaceImport()
-    if (ns) bindings.push({ localName: ns.getText(), importedName: '*', isDefault: false })
-    analysis.imports.push({ moduleSpecifier, bindings })
-  }
-
-  // ── Symbols ──
-  const addSymbol = (node, name, kind, extraMeta = {}) => {
-    const exported = isExported(node)
-    const pos = source.getLineAndColumnAtPos(node.getStart())
-    const sym = { name, kind, exported, startLine: pos.line, startCol: pos.column, signature: computeSignature(node), metadata: { ...analysis.metadata, ...extraMeta } }
-    analysis.symbols.push(sym)
-    if (exported && node.isDefaultExport?.()) analysis.symbols.push({ ...sym, name: 'default' })
-  }
-
-  // Functions
-  for (const fn of source.getFunctions()) {
-    if (!fn.getName()) continue
-    let kind = 'function'
-    let props = null
-
-    if (framework === 'nextjs' && analysis.fileRole === 'route' && ['GET','POST','PUT','DELETE','PATCH'].includes(fn.getName())) kind = 'route_handler'
-    if (framework === 'nextjs' && analysis.fileRole === 'middleware' && fn.getName() === 'middleware') kind = 'middleware'
-    if ((framework === 'react' || framework === 'nextjs') && analysis.metadata.isClientComponent && fn.getName()[0] === fn.getName()[0].toUpperCase()) {
-      kind = 'component'
-      props = extractProps(fn)
+// ─── UNIVERSAL ANALYZER (MEMORY LEAK FIX) ──────────────────────────
+// Creates a single shared ts-morph Project and reuses it across all files
+// to avoid the O(n) per-file project instantiation overhead.
+function createAnalyzer() {
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    compilerOptions: { allowJs: true, jsx: 2, skipLibCheck: true }
+  })
+  
+  return function analyzeFile(filePath, code, language, framework) {
+    const source = project.createSourceFile(filePath, code, { overwrite: true })
+    const analysis = {
+      imports: [],
+      symbols: [],
+      localEdges: [],
+      routes: [],
+      fileRole: getFileRole(filePath, framework),
+      framework,
+      metadata: {}
     }
-    if ((framework === 'express' || framework === 'fastify') && analysis.fileRole === 'route' && fn.hasExportKeyword()) kind = 'route_handler'
-
-    addSymbol(fn, fn.getName(), kind, { props })
-  }
-
-  // Classes
-  for (const cls of source.getClasses()) {
-    if (!cls.getName()) continue
-    let kind = 'class'
-    if (framework === 'nestjs') {
-      for (const dec of cls.getDecorators()) {
-        const name = dec.getName()
-        if (name === 'Controller') kind = 'controller'
-        if (name === 'Injectable') kind = 'service'
-        if (name === 'Module') kind = 'module'
-        if (name === 'Guard') kind = 'guard'
-        if (name === 'Interceptor') kind = 'interceptor'
-      }
+    switch (framework) {
+      case 'nextjs':
+        analysis.metadata.isClientComponent = /^\s*['"]use client['"]/.test(source.getFullText())
+        analysis.metadata.isServerComponent = /^\s*['"]use server['"]/.test(source.getFullText())
+        break
+      case 'express':
+      case 'fastify':
+        analysis.metadata.isEntryPoint = ['app.js','app.ts','server.js','server.ts','index.js','index.ts'].includes(filePath.split('/').pop())
+        break
     }
-    addSymbol(cls, cls.getName(), kind)
-  }
-
-  // Interfaces & Types
-  for (const iface of source.getInterfaces()) if (iface.getName()) addSymbol(iface, iface.getName(), 'interface')
-  for (const typeAlias of source.getTypeAliases()) if (typeAlias.getName()) addSymbol(typeAlias, typeAlias.getName(), 'type')
-
-  // Variable declarations (arrow functions, components, hooks)
-  for (const varStmt of source.getVariableStatements()) {
-    for (const decl of varStmt.getDeclarations()) {
-      const init = decl.getInitializer()
-      let kind = 'variable'
+    
+    for (const imp of source.getImportDeclarations()) {
+      const moduleSpecifier = imp.getModuleSpecifierValue()
+      const bindings = []
+      const defaultImport = imp.getDefaultImport()
+      if (defaultImport) bindings.push({ localName: defaultImport.getText(), importedName: 'default', isDefault: true })
+      for (const named of imp.getNamedImports()) bindings.push({ localName: named.getName(), importedName: named.getName(), isDefault: false })
+      const ns = imp.getNamespaceImport()
+      if (ns) bindings.push({ localName: ns.getText(), importedName: '*', isDefault: false })
+      analysis.imports.push({ moduleSpecifier, bindings })
+    }
+    
+    const addSymbol = (node, name, kind, extraMeta = {}) => {
+      const exported = isExported(node)
+      const pos = source.getLineAndColumnAtPos(node.getStart())
+      const sym = { name, kind, exported, startLine: pos.line, startCol: pos.column, signature: computeSignature(node), metadata: { ...analysis.metadata, ...extraMeta } }
+      analysis.symbols.push(sym)
+      if (exported && node.isDefaultExport?.()) analysis.symbols.push({ ...sym, name: 'default' })
+    }
+    
+    for (const fn of source.getFunctions()) {
+      if (!fn.getName()) continue
+      let kind = 'function'
       let props = null
-
-      if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
-        kind = 'arrow_function'
-
-        if ((framework === 'react' || framework === 'nextjs') && decl.getName()[0] === decl.getName()[0].toUpperCase()) {
-          kind = 'component'
-          props = extractProps(init)
-        }
-        if ((framework === 'react' || framework === 'nextjs') && decl.getName().startsWith('use') && decl.getName().length > 3 && decl.getName()[3] === decl.getName()[3].toUpperCase()) kind = 'hook'
-        if ((framework === 'vue' || framework === 'nuxt') && decl.getName().startsWith('use') && filePath.includes('composables')) kind = 'composable'
+      if (framework === 'nextjs' && analysis.fileRole === 'route' && ['GET','POST','PUT','DELETE','PATCH'].includes(fn.getName())) kind = 'route_handler'
+      if (framework === 'nextjs' && analysis.fileRole === 'middleware' && fn.getName() === 'middleware') kind = 'middleware'
+      if ((framework === 'react' || framework === 'nextjs') && analysis.metadata.isClientComponent && fn.getName()[0] === fn.getName()[0].toUpperCase()) {
+        kind = 'component'
+        props = extractProps(fn)
       }
-
-      addSymbol(decl, decl.getName(), kind, { props })
+      if ((framework === 'express' || framework === 'fastify') && analysis.fileRole === 'route' && fn.hasExportKeyword()) kind = 'route_handler'
+      addSymbol(fn, fn.getName(), kind, { props })
     }
-  }
-
-  // Class methods
-  for (const cls of source.getClasses()) {
-    const cName = cls.getName() || 'anonymous'
-    for (const method of cls.getMethods()) {
-      if (!method.getName()) continue
-      let kind = 'method'
+    
+    for (const cls of source.getClasses()) {
+      if (!cls.getName()) continue
+      let kind = 'class'
       if (framework === 'nestjs') {
-        for (const dec of method.getDecorators()) {
+        for (const dec of cls.getDecorators()) {
           const name = dec.getName()
-          if (['Get','Post','Put','Delete','Patch','All'].includes(name)) {
-            kind = 'route_handler'
-            const args = dec.getArguments()
-            if (args.length > 0 && Node.isStringLiteral(args[0])) {
-              analysis.routes.push({ method: name.toUpperCase(), path: args[0].getLiteralValue() })
+          if (name === 'Controller') kind = 'controller'
+          if (name === 'Injectable') kind = 'service'
+          if (name === 'Module') kind = 'module'
+          if (name === 'Guard') kind = 'guard'
+          if (name === 'Interceptor') kind = 'interceptor'
+        }
+      }
+      addSymbol(cls, cls.getName(), kind)
+    }
+    
+    for (const iface of source.getInterfaces()) if (iface.getName()) addSymbol(iface, iface.getName(), 'interface')
+    for (const typeAlias of source.getTypeAliases()) if (typeAlias.getName()) addSymbol(typeAlias, typeAlias.getName(), 'type')
+    
+    for (const varStmt of source.getVariableStatements()) {
+      for (const decl of varStmt.getDeclarations()) {
+        const init = decl.getInitializer()
+        let kind = 'variable'
+        let props = null
+        if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
+          kind = 'arrow_function'
+          if ((framework === 'react' || framework === 'nextjs') && decl.getName()[0] === decl.getName()[0].toUpperCase()) {
+            kind = 'component'
+            props = extractProps(init)
+          }
+          if ((framework === 'react' || framework === 'nextjs') && decl.getName().startsWith('use') && decl.getName().length > 3 && decl.getName()[3] === decl.getName()[3].toUpperCase()) kind = 'hook'
+          if ((framework === 'vue' || framework === 'nuxt') && decl.getName().startsWith('use') && filePath.includes('composables')) kind = 'composable'
+        }
+        addSymbol(decl, decl.getName(), kind, { props })
+      }
+    }
+    
+    for (const cls of source.getClasses()) {
+      const cName = cls.getName() || 'anonymous'
+      for (const method of cls.getMethods()) {
+        if (!method.getName()) continue
+        let kind = 'method'
+        if (framework === 'nestjs') {
+          for (const dec of method.getDecorators()) {
+            const name = dec.getName()
+            if (['Get','Post','Put','Delete','Patch','All'].includes(name)) {
+              kind = 'route_handler'
+              const args = dec.getArguments()
+              if (args.length > 0 && Node.isStringLiteral(args[0])) {
+                analysis.routes.push({ method: name.toUpperCase(), path: args[0].getLiteralValue() })
+              }
             }
           }
         }
-      }
-      addSymbol(method, `${cName}.${method.getName()}`, kind)
-    }
-  }
-
-  // ── Edges: Calls + Renders ──
-  const containers = []
-  for (const fn of source.getFunctions()) if (fn.getName()) containers.push({ node: fn, name: fn.getName() })
-  for (const varStmt of source.getVariableStatements()) {
-    for (const decl of varStmt.getDeclarations()) {
-      const init = decl.getInitializer()
-      if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
-        containers.push({ node: init, name: decl.getName() })
+        addSymbol(method, `${cName}.${method.getName()}`, kind)
       }
     }
-  }
-
-  for (const container of containers) {
-    // Calls
-    for (const call of container.node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-      const expr = call.getExpression()
-      let calledName = null
-      let edgeMeta = {}
-
-      if (Node.isIdentifier(expr)) {
-        calledName = expr.getText()
-      } else if (Node.isPropertyAccessExpression(expr)) {
-        calledName = expr.getName()
-        const objName = expr.getExpression().getText()
-        const nsImport = analysis.imports.find(i => i.bindings.some(b => b.localName === objName && b.importedName === '*'))
-        if (nsImport) {
-          edgeMeta = { callExpression: expr.getText(), namespaceObject: objName, resolvedModule: nsImport.moduleSpecifier }
-          analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: edgeMeta })
-          continue
+    
+    const containers = []
+    for (const fn of source.getFunctions()) if (fn.getName()) containers.push({ node: fn, name: fn.getName() })
+    for (const varStmt of source.getVariableStatements()) {
+      for (const decl of varStmt.getDeclarations()) {
+        const init = decl.getInitializer()
+        if (init && (init.isKind(SyntaxKind.ArrowFunction) || init.isKind(SyntaxKind.FunctionExpression))) {
+          containers.push({ node: init, name: decl.getName() })
         }
-
-        if ((framework === 'express' || framework === 'fastify') && ['get','post','put','delete','patch','use'].includes(calledName)) {
-          const args = call.getArguments()
-          if (args.length > 0 && (Node.isStringLiteral(args[0]) || Node.isTemplateExpression(args[0]))) {
-            const routePath = args[0].getText().replace(/['"`]/g, '')
-            analysis.routes.push({ method: calledName.toUpperCase(), path: routePath })
+      }
+    }
+    
+    for (const container of containers) {
+      for (const call of container.node.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+        const expr = call.getExpression()
+        let calledName = null
+        let edgeMeta = {}
+        if (Node.isIdentifier(expr)) {
+          calledName = expr.getText()
+        } else if (Node.isPropertyAccessExpression(expr)) {
+          calledName = expr.getName()
+          const objName = expr.getExpression().getText()
+          const nsImport = analysis.imports.find(i => i.bindings.some(b => b.localName === objName && b.importedName === '*'))
+          if (nsImport) {
+            edgeMeta = { callExpression: expr.getText(), namespaceObject: objName, resolvedModule: nsImport.moduleSpecifier }
+            analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: edgeMeta })
+            continue
+          }
+          if ((framework === 'express' || framework === 'fastify') && ['get','post','put','delete','patch','use'].includes(calledName)) {
+            const args = call.getArguments()
+            if (args.length > 0 && (Node.isStringLiteral(args[0]) || Node.isTemplateExpression(args[0]))) {
+              const routePath = args[0].getText().replace(/['"`]/g, '')
+              analysis.routes.push({ method: calledName.toUpperCase(), path: routePath })
+            }
+          }
+        }
+        if (calledName) {
+          analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: { callExpression: expr.getText() } })
+        }
+      }
+      
+      if (framework === 'react' || framework === 'nextjs' || framework === 'remix') {
+        for (const jsx of container.node.getDescendantsOfKind(SyntaxKind.JsxOpeningElement).concat(container.node.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement))) {
+          const tagName = jsx.getTagNameNode().getText()
+          if (tagName[0] === tagName[0].toUpperCase()) {
+            analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: tagName, edgeType: 'RENDERS', metadata: { jsxTag: tagName } })
           }
         }
       }
-
-      if (calledName) {
-        analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: calledName, edgeType: 'CALLS', metadata: { callExpression: expr.getText() } })
-      }
     }
-
-    // Renders (JSX)
-    if (framework === 'react' || framework === 'nextjs' || framework === 'remix') {
-      for (const jsx of container.node.getDescendantsOfKind(SyntaxKind.JsxOpeningElement).concat(container.node.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement))) {
-        const tagName = jsx.getTagNameNode().getText()
-        if (tagName[0] === tagName[0].toUpperCase()) {
-          analysis.localEdges.push({ fromSymbolName: container.name, toSymbolName: tagName, edgeType: 'RENDERS', metadata: { jsxTag: tagName } })
+    
+    for (const cls of source.getClasses()) {
+      const className = cls.getName()
+      if (!className) continue
+      for (const heritage of cls.getHeritageClauses()) {
+        for (const expr of heritage.getExpressions()) {
+          const typeName = expr.getExpression().getText()
+          const edgeType = heritage.getToken() === SyntaxKind.ExtendsKeyword ? 'EXTENDS' : 'IMPLEMENTS'
+          analysis.localEdges.push({ fromSymbolName: className, toSymbolName: typeName, edgeType, metadata: {} })
         }
       }
     }
-  }
-
-  // ── Heritage ──
-  for (const cls of source.getClasses()) {
-    const className = cls.getName()
-    if (!className) continue
-    for (const heritage of cls.getHeritageClauses()) {
-      for (const expr of heritage.getExpressions()) {
-        const typeName = expr.getExpression().getText()
-        const edgeType = heritage.getToken() === SyntaxKind.ExtendsKeyword ? 'EXTENDS' : 'IMPLEMENTS'
-        analysis.localEdges.push({ fromSymbolName: className, toSymbolName: typeName, edgeType, metadata: {} })
+    
+    if (framework === 'express' || framework === 'fastify') {
+      const text = source.getFullText()
+      const routeRegex = /(get|post|put|delete|patch)\(['"`](.*?)['"`]/gi
+      let match
+      while ((match = routeRegex.exec(text)) !== null) {
+        const existing = analysis.routes.find(r => r.method === match[1].toUpperCase() && r.path === match[2])
+        if (!existing) analysis.routes.push({ method: match[1].toUpperCase(), path: match[2] })
       }
     }
+    return analysis
   }
-
-  // ── Express/Fastify regex fallback ──
-  if (framework === 'express' || framework === 'fastify') {
-    const text = source.getFullText()
-    const routeRegex = /(get|post|put|delete|patch)\(['"`](.*?)['"`]/gi
-    let match
-    while ((match = routeRegex.exec(text)) !== null) {
-      const existing = analysis.routes.find(r => r.method === match[1].toUpperCase() && r.path === match[2])
-      if (!existing) analysis.routes.push({ method: match[1].toUpperCase(), path: match[2] })
-    }
-  }
-
-  return analysis
 }
 
 // ─── BATCH UPSERT ──────────────────────────────────────────────────
@@ -414,19 +382,19 @@ async function batchUpsert(table, rows, onConflict, chunkSize = 500) {
 async function run() {
   console.log(`\n🔥 Forge Universal Indexer — ${REPO} (repo_id: ${REPO_ID})`)
   if (SOURCE_ROOT) console.log(`📂 Source root: ${SOURCE_ROOT}`)
-
+  
   detectedFramework = await detectFramework()
   console.log(`🎯 Framework: ${detectedFramework}`)
-
+  
   const startTime = Date.now()
-
   const files = await getRepoFiles()
   const targetFiles = files.filter(f => detectLanguage(f.path) !== null)
   console.log(`📁 ${targetFiles.length} source files found`)
-
+  
+  const analyzeFile = createAnalyzer() // ✅ FIX: Instantiate ONCE outside the loop
   const analyses = new Map()
   const allPaths = new Set(targetFiles.map(f => f.path))
-
+  
   for (const f of targetFiles) {
     try {
       const code = await getFile(f.path)
@@ -437,25 +405,29 @@ async function run() {
     }
   }
   console.log(`🔍 ${analyses.size} files analyzed`)
-
-  // Resolve imports
+  
   for (const [filePath, analysis] of analyses) {
     for (const imp of analysis.imports) imp.resolvedPath = resolveModule(filePath, imp.moduleSpecifier, allPaths)
   }
-
-  // Upsert files
+  
   const fileRows = targetFiles.filter(f => analyses.has(f.path)).map(f => ({
     repo_id: REPO_ID, path: f.path, sha: f.sha, language: detectLanguage(f.path), parsed_at: new Date().toISOString()
   }))
   await batchUpsert('files', fileRows, 'repo_id,path', 500)
-
-  // Fetch file IDs
+  
   const { data: dbFiles } = await supabase.from('files').select('id,path').eq('repo_id', REPO_ID)
   const fileIdMap = new Map()
   const fileIdToPath = new Map()
   for (const f of dbFiles || []) { fileIdMap.set(f.path, f.id); fileIdToPath.set(f.id, f.path) }
-
-  // Prepare symbols
+  
+  // ✅ FIX: GRAPH CLEANUP - Delete stale symbols and edges before upserting
+  const fileIdsToClean = [...fileIdMap.values()]
+  for (let i = 0; i < fileIdsToClean.length; i += 100) {
+    const chunk = fileIdsToClean.slice(i, i + 100)
+    await supabase.from('symbols').delete().in('file_id', chunk).neq('name', '__file__')
+    await supabase.from('edges').delete().in('source_file_id', chunk)
+  }
+  
   const symbolRows = []
   for (const [path, analysis] of analyses) {
     const fileId = fileIdMap.get(path)
@@ -472,8 +444,7 @@ async function run() {
     }
   }
   await batchUpsert('symbols', symbolRows, 'file_id,name,kind', 500)
-
-  // Fetch symbol IDs
+  
   const allFileIds = [...fileIdMap.values()]
   let dbSymbols = []
   for (let i = 0; i < allFileIds.length; i += 100) {
@@ -482,33 +453,29 @@ async function run() {
     if (error) throw error
     dbSymbols.push(...(data || []))
   }
-
+  
   const symbolIndex = new Map()
   const fileSymbolIdMap = new Map()
   const globalExportedSymbols = new Map()
-
   for (const s of dbSymbols) {
     const path = fileIdToPath.get(s.file_id)
     if (!path) continue
     if (!symbolIndex.has(path)) symbolIndex.set(path, new Map())
     symbolIndex.get(path).set(s.name, s.id)
     if (s.name === '__file__') fileSymbolIdMap.set(s.file_id, s.id)
-
     const analysis = analyses.get(path)
     const localSym = analysis?.symbols.find(ls => ls.name === s.name)
     if (localSym?.exported && s.name !== '__file__') {
       if (!globalExportedSymbols.has(s.name)) globalExportedSymbols.set(s.name, { id: s.id, path })
     }
   }
-
-  // Build edges
+  
   const edgesToInsert = []
   for (const [filePath, analysis] of analyses) {
     const fromFileId = fileIdMap.get(filePath)
     const fromFileSymbolId = fileSymbolIdMap.get(fromFileId)
     const fromSymbols = symbolIndex.get(filePath)
-
-    // Import edges
+    
     for (const imp of analysis.imports) {
       if (!imp.resolvedPath) continue
       const targetSymbols = symbolIndex.get(imp.resolvedPath)
@@ -524,14 +491,11 @@ async function run() {
         }
       }
     }
-
-    // Local edges
+    
     for (const edge of analysis.localEdges) {
       const fromSymbolId = edge.fromSymbolName === '__file__' ? fromFileSymbolId : fromSymbols.get(edge.fromSymbolName)
       if (!fromSymbolId) continue
-
       let toSymbolId = fromSymbols.get(edge.toSymbolName)
-
       if (!toSymbolId) {
         const matchingImport = analysis.imports.find(i => i.bindings.some(b => b.localName === edge.toSymbolName))
         if (matchingImport && matchingImport.resolvedPath) {
@@ -543,17 +507,14 @@ async function run() {
           }
         }
       }
-
       if (!toSymbolId && edge.metadata?.namespaceObject) {
         const nsImport = analysis.imports.find(i => i.bindings.some(b => b.localName === edge.metadata.namespaceObject && b.importedName === '*'))
         if (nsImport && nsImport.resolvedPath) toSymbolId = symbolIndex.get(nsImport.resolvedPath)?.get(edge.toSymbolName)
       }
-
       if (!toSymbolId) {
         const global = globalExportedSymbols.get(edge.toSymbolName)
         if (global) toSymbolId = global.id
       }
-
       if (toSymbolId) {
         edgesToInsert.push({
           from_symbol_id: fromSymbolId, to_symbol_id: toSymbolId, edge_type: edge.edgeType,
@@ -562,9 +523,7 @@ async function run() {
       }
     }
   }
-
-  // ─── DEDUPLICATE EDGES ───────────────────────────────────────────
-  // PostgreSQL upsert fails if the same conflict key appears twice in one batch
+  
   const edgeKey = (e) => `${e.from_symbol_id}|${e.to_symbol_id}|${e.edge_type}|${e.source_file_id}`
   const seenEdges = new Set()
   const dedupedEdges = edgesToInsert.filter(e => {
@@ -573,20 +532,17 @@ async function run() {
     seenEdges.add(key)
     return true
   })
-
-  // Bulk insert edges
+  
   for (let i = 0; i < dedupedEdges.length; i += 1000) {
     const chunk = dedupedEdges.slice(i, i + 1000)
     const { error } = await supabase.from('edges').upsert(chunk, { onConflict: 'from_symbol_id,to_symbol_id,edge_type,source_file_id' })
     if (error) { console.error(`❌ Edge batch failed: ${error.message}`); throw error }
   }
   console.log(`🔗 ${dedupedEdges.length} edges inserted (${edgesToInsert.length - dedupedEdges.length} duplicates removed)`)
-
-  // Refresh deps
+  
   const { error: rpcErr } = await supabase.rpc('refresh_file_deps', { p_repo_id: REPO_ID })
   if (rpcErr) throw rpcErr
-
-  // Update repo status to indexed
+  
   const { data: existingSettings } = await supabase.from('repos').select('settings').eq('id', REPO_ID).single()
   const newSettings = { ...(existingSettings?.settings || {}), framework: detectedFramework }
   await supabase.from('repos').update({
@@ -595,7 +551,7 @@ async function run() {
     last_indexed_at: new Date().toISOString(),
     settings: newSettings
   }).eq('id', REPO_ID)
-
+  
   const duration = ((Date.now() - startTime) / 1000).toFixed(1)
   console.log(`✅ Complete in ${duration}s | Files: ${analyses.size} | Symbols: ${symbolRows.length} | Edges: ${dedupedEdges.length} | Framework: ${detectedFramework}`)
 }
