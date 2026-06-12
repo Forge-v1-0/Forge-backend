@@ -52,11 +52,12 @@ export async function runCoder({
   coderModel,
   apiKey
 }) {
+  if (!filePath || !instruction || !coderModel || !apiKey) {
+    throw new Error('runCoder: filePath, instruction, coderModel, and apiKey are required')
+  }
+
   const retryBlock = feedback
-    ? `\nPREVIOUS ATTEMPT WAS REJECTED.
-Human feedback: "${feedback}"
-Study the feedback carefully. Understand exactly what was wrong. Fix it completely.
-Do not repeat the same mistake.\n`
+    ? `\nPREVIOUS ATTEMPT WAS REJECTED.\nHuman feedback: "${feedback}"\nStudy the feedback carefully. Understand exactly what was wrong. Fix it completely.\nDo not repeat the same mistake.\n`
     : ''
 
   const userPrompt = `FILE: ${filePath}
