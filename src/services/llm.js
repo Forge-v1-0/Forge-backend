@@ -2,8 +2,8 @@
 // All OpenRouter calls go through this module.
 
 export const DEFAULT_MODELS = {
-  planner: 'moonshotai/kimi-k2.6:free',
-  coder: 'qwen/qwen3-coder:free'
+  planner: 'openrouter/free',
+  coder: 'openrouter/free'
 }
 
 // Max tokens we ask for. At 4000 the coder regularly truncates on large files.
@@ -21,17 +21,28 @@ function stripMarkdownFences(text) {
 }
 
 // ─── TRUNCATION DETECTION ────────────────────────────────────────
-// If finish_reason is 'length' the model hit max_tokens and the output is
-// incomplete. Surfacing this explicitly prevents corrupt code from reaching
-// the approval queue.
 function assertNotTruncated(data, model) {
   const reason = data.choices?.[0]?.finish_reason
+  const content = data.choices?.[0]?.message?.content
+
   if (reason === 'length') {
     throw new Error(
       `LLM output was truncated by ${model} (finish_reason=length). ` +
       'The model hit the token limit before completing the file. ' +
       'Try a model with a larger context window, or break the task into smaller subtasks.'
     )
+  }
+
+  // Heuristic: unbalanced braces suggest truncation
+  if (content) {
+    const openBraces = (content.match(/{/g) || []).length
+    const closeBraces = (content.match(/}/g) || []).length
+    const openParens = (content.match(/\(/g) || []).length
+    const closeParens = (content.match(/\)/g) || []).length
+
+    if (Math.abs(openBraces - closeBraces) > 2 || Math.abs(openParens - closeParens) > 2) {
+      console.warn(`Possible truncation detected in ${model} response (unbalanced braces)`)
+    }
   }
 }
 
@@ -46,8 +57,11 @@ async function withRetry(fn, retries = 3, baseDelayMs = 1500) {
     } catch (err) {
       lastErr = err
       const msg = err.message || ''
-      const isTransient = msg.includes('429') || msg.includes('503') || msg.includes('502') || msg.includes('ECONNRESET')
-      const isAuth = msg.includes('401') || msg.includes('403')
+      const isTransient = [
+        '429', '503', '502', '500', '408', '520', '524',
+        'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EPIPE'
+      ].some(code => msg.includes(code))
+      const isAuth = msg.includes('401') || msg.includes('402') || msg.includes('403')
       const isTruncated = msg.includes('truncated')
 
       if (attempt === retries || isAuth || isTruncated) throw err
@@ -62,7 +76,7 @@ async function withRetry(fn, retries = 3, baseDelayMs = 1500) {
 }
 
 // ─── RAW CALL ────────────────────────────────────────────────────
-async function callLLMRaw(messages, model, apiKey) {
+async function callLLMRaw(messages, model, apiKey, ownerId = null) {
   if (!apiKey) throw new Error('No OpenRouter API key provided')
   if (!model) throw new Error('No model specified')
 
@@ -100,22 +114,59 @@ async function callLLMRaw(messages, model, apiKey) {
   }
 
   const data = await res.json()
-  if (!data.choices?.[0]?.message?.content) {
+  if (!data.choices?.[0]?.message) {
     throw new Error(`Unexpected OpenRouter response structure: ${JSON.stringify(data).slice(0, 300)}`)
+  }
+
+  // Handle reasoning models that return null content
+  const message = data.choices[0].message
+  let content = message.content
+
+  if (!content && message.reasoning) {
+    content = message.reasoning
+    console.warn(`Model ${model} returned reasoning instead of content`)
+  }
+
+  if (!content && message.reasoning_details?.length > 0) {
+    content = message.reasoning_details
+      .map(r => r.reasoning || r.text || '')
+      .join('\n')
+  }
+
+  if (!content) {
+    throw new Error(`No content or reasoning from model ${model}. Response: ${JSON.stringify(message)}`)
   }
 
   assertNotTruncated(data, model)
 
-  return stripMarkdownFences(data.choices[0].message.content)
+  // Transparent usage tracking (for user visibility, not platform caps)
+  if (ownerId && data.usage) {
+    try {
+      const { supabase } = await import('./supabase.js')
+      await supabase.from('usage_logs').insert({
+        user_id: ownerId,
+        model: model,
+        tokens_prompt: data.usage.prompt_tokens,
+        tokens_completion: data.usage.completion_tokens,
+        tokens_total: data.usage.total_tokens,
+        created_at: new Date().toISOString()
+      })
+    } catch (e) {
+      // Non-blocking: don't fail the request if tracking fails
+      console.warn('Usage tracking failed:', e.message)
+    }
+  }
+
+  return stripMarkdownFences(content)
 }
 
 // ─── EXPORTED WRAPPERS ───────────────────────────────────────────
-export async function callLLM(messages, model, apiKey) {
-  return withRetry(() => callLLMRaw(messages, model, apiKey))
+export async function callLLM(messages, model, apiKey, ownerId) {
+  return withRetry(() => callLLMRaw(messages, model, apiKey, ownerId))
 }
 
-export async function callLLMJson(messages, model, apiKey) {
-  const raw = await callLLM(messages, model, apiKey)
+export async function callLLMJson(messages, model, apiKey, ownerId) {
+  const raw = await callLLM(messages, model, apiKey, ownerId)
   const cleaned = raw
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
