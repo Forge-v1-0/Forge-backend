@@ -3,39 +3,55 @@ import { encrypt } from '../services/crypto.js'
 const DEFAULT_PLANNER = 'openrouter/free'
 const DEFAULT_CODER = 'openrouter/free'
 
+function createError(message, code = 'INTERNAL_ERROR', statusCode = 500, details = null) {
+  const err = { error: message, code }
+  if (details) err.details = details
+  return err
+}
+
 export default async function settingsRoutes(fastify) {
   const supabase = fastify.supabase
 
   fastify.post('/settings', async (req, reply) => {
     const { openrouter_api_key, planner_model, coder_model } = req.body
     const owner_id = req.user.id
-    
+
     const finalPlanner = planner_model ?? DEFAULT_PLANNER
     const finalCoder = coder_model ?? DEFAULT_CODER
-    
+
+    // Validate model strings
+    if (finalPlanner && !/^[a-z0-9-\/.:]+$/.test(finalPlanner)) {
+      return reply.status(400).send(createError('Invalid planner_model format', 'VALIDATION_FAILED', 400))
+    }
+    if (finalCoder && !/^[a-z0-9-\/.:]+$/.test(finalCoder)) {
+      return reply.status(400).send(createError('Invalid coder_model format', 'VALIDATION_FAILED', 400))
+    }
+
     const upsertPayload = {
       owner_id,
       planner_model: finalPlanner,
       coder_model: finalCoder,
       updated_at: new Date().toISOString()
     }
-    
-    // ✅ FIX: Explicitly check for undefined to allow null to clear the key
+
     if (openrouter_api_key !== undefined) {
+      if (openrouter_api_key && !openrouter_api_key.startsWith('sk-or-v1-')) {
+        return reply.status(400).send(createError('API key must start with sk-or-v1-', 'VALIDATION_FAILED', 400))
+      }
       upsertPayload.openrouter_api_key = openrouter_api_key ? encrypt(openrouter_api_key) : null
     }
-    
+
     const { data, error } = await supabase
       .from('user_settings')
       .upsert(upsertPayload, { onConflict: 'owner_id' })
       .select('id, owner_id, planner_model, coder_model, updated_at')
       .single()
-      
+
     if (error) {
-      console.error('DEBUG settings save error:', error)
-      return reply.status(500).send({ error: error.message })
+      console.error('Settings save error:', error)
+      return reply.status(500).send(createError(error.message, 'DB_ERROR'))
     }
-    
+
     return reply.send({ ok: true, settings: data })
   })
 
@@ -46,7 +62,7 @@ export default async function settingsRoutes(fastify) {
       .select('id, owner_id, planner_model, coder_model, updated_at, openrouter_api_key')
       .eq('owner_id', owner_id)
       .single()
-      
+
     if (error || !data) {
       return reply.send({
         settings: {
@@ -56,7 +72,7 @@ export default async function settingsRoutes(fastify) {
         }
       })
     }
-    
+
     return reply.send({
       settings: {
         planner_model: data.planner_model,
@@ -72,11 +88,11 @@ export default async function settingsRoutes(fastify) {
     try {
       const { data: repos } = await supabase.from('repos').select('id').eq('owner_id', owner_id)
       const repoIds = repos?.map(r => r.id) || []
-      
+
       if (repoIds.length > 0) {
         const { data: sessions } = await supabase.from('sessions').select('id').in('repo_id', repoIds)
         const sessionIds = sessions?.map(s => s.id) || []
-        
+
         if (sessionIds.length > 0) {
           await supabase.from('agent_memory').delete().in('session_id', sessionIds)
           await supabase.from('code_drafts').delete().in('session_id', sessionIds)
@@ -87,18 +103,18 @@ export default async function settingsRoutes(fastify) {
         await supabase.from('repo_index').delete().in('repo_id', repoIds)
         await supabase.from('repos').delete().in('id', repoIds)
       }
-      
+
       await supabase.from('user_settings').delete().eq('owner_id', owner_id)
       const { error: authError } = await supabase.auth.admin.deleteUser(owner_id)
       if (authError) {
         console.error('Failed to delete auth user:', authError.message)
-        return reply.status(500).send({ error: 'Failed to delete auth user' })
+        return reply.status(500).send(createError('Failed to delete auth user', 'AUTH_ERROR'))
       }
-      
+
       return reply.send({ ok: true })
     } catch (err) {
       console.error('Account deletion failed:', err.message)
-      return reply.status(500).send({ error: err.message })
+      return reply.status(500).send(createError(err.message, 'DELETE_ERROR'))
     }
   })
 }

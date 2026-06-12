@@ -1,4 +1,5 @@
 import { callLLM } from './llm.js'
+import { z } from 'zod'
 
 const CODER_SYSTEM_PROMPT = `You are an elite software engineer. Your code is the benchmark other engineers measure themselves against.
 
@@ -41,6 +42,9 @@ No explanation before or after.
 No comments describing what you changed.
 Just the complete, production-ready file content.`
 
+// Response schema: must be valid code string, not empty
+const CodeResponseSchema = z.string().min(1).max(100000)
+
 export async function runCoder({
   filePath,
   language,
@@ -73,7 +77,7 @@ RISK REASON: ${riskReason || 'Standard change'}
 ${retryBlock}
 Write the complete updated file. Apply your full standards. Ship it.`
 
-  return callLLM(
+  const raw = await callLLM(
     [
       { role: 'system', content: CODER_SYSTEM_PROMPT },
       { role: 'user', content: userPrompt }
@@ -81,4 +85,11 @@ Write the complete updated file. Apply your full standards. Ship it.`
     coderModel,
     apiKey
   )
+
+  // Validate response is non-empty code
+  try {
+    return CodeResponseSchema.parse(raw)
+  } catch (zodError) {
+    throw new Error(`Coder returned invalid response: ${zodError.errors.map(e => e.message).join(', ')}`)
+  }
 }
