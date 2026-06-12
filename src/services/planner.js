@@ -1,4 +1,5 @@
 import { callLLMJson, callLLM } from './llm.js'
+import { z } from 'zod'
 
 const PLANNER_SYSTEM_PROMPT = `You are a principal software engineer and technical lead with deep expertise in system design, debugging, and code architecture.
 
@@ -51,6 +52,24 @@ When given a task you must:
 
 Respond only with valid JSON. No markdown. No explanation outside the JSON.`
 
+// ─── ZOD SCHEMAS ──────────────────────────────────────────────
+const SubtaskSchema = z.object({
+  instruction: z.string().min(1).max(5000),
+  file_path: z.string().min(1).max(500),
+  risk: z.enum(['low', 'medium', 'high']),
+  risk_reason: z.string().max(500).optional()
+})
+
+const PlanSchema = z.object({
+  analysis: z.string().min(1).max(2000),
+  subtasks: z.array(SubtaskSchema).min(1).max(10)
+})
+
+const ReplanSchema = z.object({
+  analysis: z.string().min(1).max(2000),
+  subtask: SubtaskSchema
+})
+
 export async function runPlanner({ task, context, memory, plannerModel, apiKey }) {
   if (!task || !plannerModel || !apiKey) {
     throw new Error('runPlanner: task, plannerModel, and apiKey are required')
@@ -85,7 +104,7 @@ Return JSON only:
   ]
 }`
 
-  return callLLMJson(
+  const raw = await callLLMJson(
     [
       { role: 'system', content: PLANNER_SYSTEM_PROMPT },
       { role: 'user', content: userPrompt }
@@ -93,6 +112,13 @@ Return JSON only:
     plannerModel,
     apiKey
   )
+
+  try {
+    return PlanSchema.parse(raw)
+  } catch (zodError) {
+    console.error('Invalid plan structure:', zodError.errors)
+    throw new Error(`Planner returned invalid structure: ${zodError.errors.map(e => e.message).join(', ')}`)
+  }
 }
 
 export async function replanSubtask({
@@ -143,7 +169,7 @@ Return JSON only:
   }
 }`
 
-  return callLLMJson(
+  const raw = await callLLMJson(
     [
       { role: 'system', content: PLANNER_SYSTEM_PROMPT },
       { role: 'user', content: userPrompt }
@@ -151,6 +177,13 @@ Return JSON only:
     plannerModel,
     apiKey
   )
+
+  try {
+    return ReplanSchema.parse(raw)
+  } catch (zodError) {
+    console.error('Invalid replan structure:', zodError.errors)
+    throw new Error(`Replan returned invalid structure: ${zodError.errors.map(e => e.message).join(', ')}`)
+  }
 }
 
 export async function generateExplanation({ instruction, originalContent, newContent, plannerModel, apiKey }) {
