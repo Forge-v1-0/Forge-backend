@@ -1,3 +1,7 @@
+
+  }
+  process.exit(1)
+})
 import axios from 'axios'
 import { Project, SyntaxKind, Node } from 'ts-morph'
 import { createClient } from '@supabase/supabase-js'
@@ -545,10 +549,27 @@ async function run() {
   
   const { data: existingSettings } = await supabase.from('repos').select('settings').eq('id', REPO_ID).single()
   const newSettings = { ...(existingSettings?.settings || {}), framework: detectedFramework }
+  // ─── GET LATEST SHA AND MARK INDEXED ───────────────────────────
+  async function getLatestSha() {
+    try {
+      const branch = await getDefaultBranch()
+      const res = await axios.get(`https://api.github.com/repos/${REPO}/git/ref/heads/${branch}`, {
+        headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
+      })
+      return res.data.object?.sha || null
+    } catch (err) {
+      console.warn('Could not get latest SHA for indexing:', err.message)
+      return null
+    }
+  }
+
+  const latestSha = await getLatestSha()
+
   await supabase.from('repos').update({
     index_status: 'indexed',
     file_count: analyses.size,
     last_indexed_at: new Date().toISOString(),
+    last_indexed_sha: latestSha,
     settings: newSettings
   }).eq('id', REPO_ID)
   
