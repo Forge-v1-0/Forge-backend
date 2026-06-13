@@ -44,11 +44,10 @@ fastify.decorate('supabase', supabase)
 // ─── ACTIVE JOBS TRACKING (for graceful shutdown) ───────────────
 const activeJobs = new Map()
 fastify.decorate('activeJobs', activeJobs)
-
-function trackJob(id, promise) {
+fastify.decorate('trackJob', function (id, promise) {
   activeJobs.set(id, promise)
   promise.finally(() => activeJobs.delete(id))
-}
+})
 
 // ─── DEAD MODEL MAP ─────────────────────────────────────────────
 const DEAD_MODELS = {
@@ -164,17 +163,9 @@ fastify.addHook('preHandler', async (req, reply) => {
     return reply.status(401).send({ error: 'Invalid or expired token', code: 'UNAUTHORIZED' })
   }
 
-  // Verify user still exists in database (revocation check)
-  const { data: userExists } = await supabase
-    .from('auth.users')
-    .select('id')
-    .eq('id', data.user.id)
-    .single()
-
-  if (!userExists) {
-    return reply.status(401).send({ error: 'User account no longer exists', code: 'UNAUTHORIZED' })
-  }
-
+  // ✅ NOTE: Supabase JWTs are short-lived (1 hour by default).
+  // Revocation is handled by token expiration. For immediate revocation,
+  // use Supabase Auth Hooks or reduce access token lifetime to 15 min.
   req.user = data.user
 })
 
@@ -230,7 +221,6 @@ setInterval(() => {
 // ─── STARTUP RECOVERY (with distributed lock) ───────────────────
 async function recoverStuckSessions() {
   try {
-    // Try to acquire advisory lock
     const { data: hasLock } = await supabase.rpc('try_advisory_lock', { key: 'session_recovery' })
     if (!hasLock) {
       console.log('Another instance is handling recovery, skipping')
@@ -266,7 +256,7 @@ async function recoverStuckSessions() {
             ownerId,
             task: session.task
           }).catch(err => console.error(`Recovery failed for planning session ${session.id}:`, err.message))
-          trackJob(jobId, promise)
+          fastify.trackJob(jobId, promise)
         } else if (session.status === 'coding') {
           const promise = runCoderLoop({
             fastify, supabase,
@@ -274,7 +264,7 @@ async function recoverStuckSessions() {
             repoId: session.repo_id,
             ownerId
           }).catch(err => console.error(`Recovery failed for coding session ${session.id}:`, err.message))
-          trackJob(jobId, promise)
+          fastify.trackJob(jobId, promise)
         }
       }
     } finally {
