@@ -2,8 +2,8 @@
 // All OpenRouter calls go through this module.
 
 export const DEFAULT_MODELS = {
-  planner: 'openrouter/free',
-  coder: 'openrouter/free'
+  planner: 'moonshotai/kimi-k2.6:free',
+  coder: 'qwen/qwen3-coder:free'
 }
 
 // Max tokens we ask for. At 4000 the coder regularly truncates on large files.
