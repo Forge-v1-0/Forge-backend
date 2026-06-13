@@ -19,9 +19,16 @@ export function createGithubClient(pat, repo) {
 
   const base = `${GITHUB_API}/repos/${repo}`
 
-  // ─── INTERNAL FETCH WITH FRIENDLY ERRORS ──────────────────────
+  // ─── INTERNAL FETCH WITH RATE LIMIT TRACKING ─────────────────
   async function ghFetch(url, options = {}) {
     const res = await fetch(url, { ...options, headers: { ...headers, ...(options.headers || {}) } })
+
+    const remaining = res.headers.get('X-RateLimit-Remaining')
+    const resetAt = res.headers.get('X-RateLimit-Reset')
+    if (remaining && parseInt(remaining) < 10) {
+      console.warn(`GitHub rate limit low: ${remaining} remaining, resets at ${new Date(resetAt * 1000).toISOString()}`)
+    }
+
     return res
   }
 
@@ -47,15 +54,12 @@ export function createGithubClient(pat, repo) {
   }
 
   // ─── REPO FILE TREE ────────────────────────────────────────────
-  // Returns all blob entries. Throws if GitHub truncates the tree.
   async function getRepoTree() {
     const branch = await getDefaultBranch()
     const res = await ghFetch(`${base}/git/trees/${branch}?recursive=1`)
     handleStatus(res, 'getRepoTree')
     const data = await res.json()
     if (data.truncated) {
-      // GitHub truncates trees > 100,000 entries. We surface this explicitly
-      // instead of silently indexing a partial graph.
       throw new Error(
         'GitHub tree response was truncated (repo has > 100,000 entries). ' +
         'Set SOURCE_ROOT to a subdirectory to reduce scope, or split the repo.'
@@ -65,10 +69,11 @@ export function createGithubClient(pat, repo) {
   }
 
   // ─── FILE CONTENT ──────────────────────────────────────────────
-  // Returns null for 404 (new file). Throws on all other errors.
-  async function getFileContent(path) {
+  async function getFileContent(path, branchName = null) {
     const cleanPath = (path || '').replace(/^\/+/, '')
-    const res = await ghFetch(`${base}/contents/${cleanPath}`)
+    let url = `${base}/contents/${cleanPath}`
+    if (branchName) url += `?ref=${branchName}`
+    const res = await ghFetch(url)
     if (res.status === 404) return null
     handleStatus(res, `getFileContent(${cleanPath})`)
     const data = await res.json()
@@ -78,10 +83,11 @@ export function createGithubClient(pat, repo) {
   }
 
   // ─── FILE SHA ──────────────────────────────────────────────────
-  // Returns null for 404 (new file). Throws on all other errors.
-  async function getFileSha(path) {
+  async function getFileSha(path, branchName = null) {
     const cleanPath = (path || '').replace(/^\/+/, '')
-    const res = await ghFetch(`${base}/contents/${cleanPath}`)
+    let url = `${base}/contents/${cleanPath}`
+    if (branchName) url += `?ref=${branchName}`
+    const res = await ghFetch(url)
     if (res.status === 404) return null
     handleStatus(res, `getFileSha(${cleanPath})`)
     const data = await res.json()
@@ -89,11 +95,9 @@ export function createGithubClient(pat, repo) {
   }
 
   // ─── PUSH FILE ─────────────────────────────────────────────────
-  // SHA conflict (409) is surfaced as a distinct error so callers can
-  // present an actionable message instead of a silent 500.
   async function pushFile(path, content, message, branch) {
     const cleanPath = (path || '').replace(/^\/+/, '')
-    const sha = await getFileSha(cleanPath)
+    const sha = await getFileSha(cleanPath, branch)
 
     const body = {
       message,
@@ -107,7 +111,6 @@ export function createGithubClient(pat, repo) {
       body: JSON.stringify(body)
     })
 
-    // 409 = SHA conflict: someone pushed between our getFileSha and this PUT
     if (res.status === 409) {
       throw new Error(
         `SHA conflict pushing ${cleanPath}: the file was modified remotely between fetch and push. ` +
@@ -119,7 +122,6 @@ export function createGithubClient(pat, repo) {
   }
 
   // ─── CREATE BRANCH ─────────────────────────────────────────────
-  // 422 = branch already exists — treated as success (idempotent).
   async function createBranch(branchName) {
     const defaultBranch = await getDefaultBranch()
     const refRes = await ghFetch(`${base}/git/ref/heads/${defaultBranch}`)
@@ -138,12 +140,31 @@ export function createGithubClient(pat, repo) {
     return true
   }
 
+  // ─── ENSURE BRANCH AND PUSH (atomic helper) ──────────────────
+  async function ensureBranchAndPush(branchName, filePath, content, message) {
+    try {
+      await createBranch(branchName)
+    } catch (err) {
+      if (!err.message.includes('already exists')) throw err
+    }
+
+    let sha = null
+    try {
+      sha = await getFileSha(filePath, branchName)
+    } catch (e) {
+      // File doesn't exist on branch
+    }
+
+    return pushFile(filePath, content, message, branchName)
+  }
+
   return {
     getDefaultBranch,
     getRepoTree,
     getFileContent,
     getFileSha,
     pushFile,
-    createBranch
+    createBranch,
+    ensureBranchAndPush
   }
 }

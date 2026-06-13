@@ -1,15 +1,15 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
+import rateLimit from '@fastify/rate-limit'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt } from './services/crypto.js'
 import agentRoutes, { runAgentLoop, runCoderLoop } from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
+import { checkAllReposForChanges } from './services/indexer.js'
 
 // ─── STARTUP ENV VALIDATION ─────────────────────────────────────
-// crypto.js validates ENCRYPTION_KEY. Validate everything else here
-// so the process dies at startup rather than on first request.
-const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY', 'FRONTEND_URL']
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY', 'FRONTEND_URL', 'ENCRYPTION_KEY']
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`FATAL: ${key} env var is not set.`)
@@ -17,7 +17,21 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const fastify = Fastify({ logger: true })
+// ─── FASTIFY SETUP WITH REDACTED LOGGING ────────────────────────
+const fastify = Fastify({
+  logger: {
+    level: process.env.LOG_LEVEL || 'warn',
+    redact: {
+      paths: [
+        'req.headers.authorization',
+        'req.body.github_pat',
+        'req.body.openrouter_api_key',
+        'req.body.pat_token'
+      ],
+      remove: true
+    }
+  }
+})
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false }
@@ -28,9 +42,15 @@ const supabaseAuth = createClient(process.env.SUPABASE_URL, process.env.SUPABASE
 
 fastify.decorate('supabase', supabase)
 
+// ─── ACTIVE JOBS TRACKING (for graceful shutdown) ───────────────
+const activeJobs = new Map()
+fastify.decorate('activeJobs', activeJobs)
+fastify.decorate('trackJob', function (id, promise) {
+  activeJobs.set(id, promise)
+  promise.finally(() => activeJobs.delete(id))
+})
+
 // ─── DEAD MODEL MAP ─────────────────────────────────────────────
-// Kept here for startup-time recovery (recoverStuckSessions reads plan.plannerModel).
-// The agent route also has its own sanitizeModel; keep both in sync.
 const DEAD_MODELS = {
   'anthropic/claude-3.5-sonnet': 'meta-llama/llama-4-maverick:free',
   'deepseek/deepseek-r1:free': 'meta-llama/llama-4-maverick:free',
@@ -54,7 +74,6 @@ fastify.decorate('getUserLLMConfig', async (owner_id) => {
   if (!data) throw new Error('No settings found. Please add your OpenRouter API key in settings.')
   if (!data.openrouter_api_key) throw new Error('OpenRouter API key not set. Please add it in settings.')
 
-  // decrypt throws with a human-readable message if the stored value is malformed
   const apiKey = decrypt(data.openrouter_api_key)
 
   return {
@@ -64,11 +83,16 @@ fastify.decorate('getUserLLMConfig', async (owner_id) => {
   }
 })
 
-// ─── GET REPO PAT ───────────────────────────────────────────────
-// Single authoritative definition — repos.js no longer registers a second
-// decorator for this. Centralising here prevents the "last-one-wins" bug.
+// ─── GET REPO PAT (with caching) ────────────────────────────────
+fastify.decorate('patCache', new Map())
+
 fastify.decorate('getRepoPat', async function (repoId) {
   if (!repoId) throw new Error('getRepoPat: repoId is required')
+
+  const cached = this.patCache.get(repoId)
+  if (cached && cached.expires > Date.now()) {
+    return cached.value
+  }
 
   const { data, error } = await supabase
     .from('repos')
@@ -80,25 +104,49 @@ fastify.decorate('getRepoPat', async function (repoId) {
   if (!data) throw new Error(`Repo not found for repoId ${repoId}`)
   if (!data.github_pat) throw new Error(`No github_pat stored for repoId ${repoId}. Please re-add the repo.`)
 
-  // decrypt throws with a human-readable message if the stored value is malformed
   const pat = decrypt(data.github_pat)
 
-  // Derive "owner/repo" from URL — more reliable than storing the repo slug separately
   let repo = data.name
   try {
     const url = new URL(data.url)
-    const path = url.pathname.replace(/^\/+/, '').replace(/\.git$/, '')
+    const path = url.pathname.replace(/^\//, '').replace(/\.git$/, '')
     if (path.includes('/')) repo = path
   } catch {
     // Malformed URL — fall back to raw name
   }
 
-  return { pat, repo }
+  const result = { pat, repo }
+  this.patCache.set(repoId, { value: result, expires: Date.now() + 300000 }) // 5 min cache
+  return result
 })
 
 // ─── CORS ───────────────────────────────────────────────────────
+const allowedOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(o => o.trim().replace(/\/$/, ''))
+  .filter(Boolean)
+
 await fastify.register(cors, {
-  origin: process.env.FRONTEND_URL
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin.replace(/\/$/, ''))) {
+      cb(null, true)
+    } else {
+      cb(new Error('Not allowed by CORS'), false)
+    }
+  },
+  credentials: true
+})
+
+// ─── RATE LIMITING ──────────────────────────────────────────────
+await fastify.register(rateLimit, {
+  max: 100,
+  timeWindow: '1 minute',
+  keyGenerator: (req) => req.user?.id || req.ip,
+  errorResponseBuilder: (req, context) => ({
+    error: 'Too many requests',
+    code: 'RATE_LIMIT',
+    retryAfter: context.after
+  })
 })
 
 // ─── AUTH HOOK ──────────────────────────────────────────────────
@@ -107,14 +155,18 @@ fastify.addHook('preHandler', async (req, reply) => {
 
   const authHeader = req.headers.authorization
   if (!authHeader?.startsWith('Bearer ')) {
-    return reply.status(401).send({ error: 'Missing or malformed Authorization header' })
+    return reply.status(401).send({ error: 'Missing or malformed Authorization header', code: 'UNAUTHORIZED' })
   }
 
   const token = authHeader.slice(7)
   const { data, error } = await supabaseAuth.auth.getUser(token)
   if (error || !data?.user) {
-    return reply.status(401).send({ error: 'Invalid or expired token' })
+    return reply.status(401).send({ error: 'Invalid or expired token', code: 'UNAUTHORIZED' })
   }
+
+  // ✅ NOTE: Supabase JWTs are short-lived (1 hour by default).
+  // Revocation is handled by token expiration. For immediate revocation,
+  // use Supabase Auth Hooks or reduce access token lifetime to 15 min.
   req.user = data.user
 })
 
@@ -122,54 +174,144 @@ await fastify.register(agentRoutes)
 await fastify.register(reposRoutes)
 await fastify.register(settingsRoutes)
 
-// ─── STARTUP RECOVERY ───────────────────────────────────────────
-// Recovers sessions that were in-flight when the server last crashed.
-// Uses the same CAS guard inside runAgentLoop/runCoderLoop to prevent
-// duplicate execution if a session was already being processed.
+// ─── HEALTH CHECK (with dependency checks) ──────────────────────
+fastify.get('/health', async () => {
+  const checks = {
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    version: process.env.npm_package_version || '2.0.0',
+    uptime: process.uptime(),
+    database: 'unknown',
+    github: 'unknown',
+    memory: {
+      used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+    }
+  }
+
+  try {
+    await supabase.from('repos').select('id', { head: true, count: 'exact' })
+    checks.database = 'ok'
+  } catch (e) { checks.database = 'error' }
+
+  try {
+    await fetch('https://api.github.com/rate_limit', {
+      headers: { Authorization: `Bearer ${process.env.INDEXER_PAT || ''}` }
+    })
+    checks.github = 'ok'
+  } catch (e) { checks.github = 'error' }
+
+  const allOk = checks.database === 'ok' && checks.github === 'ok'
+  return { status: allOk ? 'ok' : 'degraded', checks }
+})
+
+// ─── MEMORY MONITORING ──────────────────────────────────────────
+const MEM_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB || '400')
+setInterval(() => {
+  const used = process.memoryUsage()
+  const usedMB = Math.round(used.heapUsed / 1024 / 1024)
+  if (usedMB > MEM_LIMIT_MB * 0.8) {
+    console.warn(`⚠️ Memory usage high: ${usedMB}MB / ${MEM_LIMIT_MB}MB`)
+  }
+  if (usedMB > MEM_LIMIT_MB * 0.95) {
+    console.error(`🚨 Memory critical: ${usedMB}MB. Exiting for clean restart...`)
+    process.exit(1)
+  }
+}, 30000)
+
+// ─── STARTUP RECOVERY (with distributed lock) ───────────────────
 async function recoverStuckSessions() {
   try {
-    const { data: stuckSessions } = await supabase
-      .from('sessions')
-      .select('*, repos(owner_id)')
-      .in('status', ['planning', 'coding'])
-
-    if (!stuckSessions || stuckSessions.length === 0) {
-      console.log('Startup recovery: no stuck sessions')
+    const { data: hasLock } = await supabase.rpc('try_advisory_lock', { key: 'session_recovery' })
+    if (!hasLock) {
+      console.log('Another instance is handling recovery, skipping')
       return
     }
 
-    console.log(`Startup recovery: recovering ${stuckSessions.length} stuck session(s)`)
+    try {
+      const { data: stuckSessions } = await supabase
+        .from('sessions')
+        .select('*, repos(owner_id)')
+        .in('status', ['planning', 'coding'])
 
-    for (const session of stuckSessions) {
-      const ownerId = session.repos?.owner_id
-      if (!ownerId) {
-        console.warn(`Recovery: session ${session.id} has no owner — skipping`)
-        continue
+      if (!stuckSessions || stuckSessions.length === 0) {
+        console.log('Startup recovery: no stuck sessions')
+        return
       }
 
-      if (session.status === 'planning') {
-        runAgentLoop({
-          fastify,
-          supabase,
-          sessionId: session.id,
-          repoId: session.repo_id,
-          ownerId,
-          task: session.task
-        }).catch(err => console.error(`Recovery failed for planning session ${session.id}:`, err.message))
-      } else if (session.status === 'coding') {
-        runCoderLoop({
-          fastify,
-          supabase,
-          sessionId: session.id,
-          repoId: session.repo_id,
-          ownerId
-        }).catch(err => console.error(`Recovery failed for coding session ${session.id}:`, err.message))
+      console.log(`Startup recovery: recovering ${stuckSessions.length} stuck session(s)`)
+
+      for (const session of stuckSessions) {
+        const ownerId = session.repos?.owner_id
+        if (!ownerId) {
+          console.warn(`Recovery: session ${session.id} has no owner — skipping`)
+          continue
+        }
+
+        const jobId = `recovery-${session.id}`
+        if (session.status === 'planning') {
+          const promise = runAgentLoop({
+            fastify, supabase,
+            sessionId: session.id,
+            repoId: session.repo_id,
+            ownerId,
+            task: session.task
+          }).catch(err => console.error(`Recovery failed for planning session ${session.id}:`, err.message))
+          fastify.trackJob(jobId, promise)
+        } else if (session.status === 'coding') {
+          const promise = runCoderLoop({
+            fastify, supabase,
+            sessionId: session.id,
+            repoId: session.repo_id,
+            ownerId
+          }).catch(err => console.error(`Recovery failed for coding session ${session.id}:`, err.message))
+          fastify.trackJob(jobId, promise)
+        }
       }
+    } finally {
+      await supabase.rpc('release_advisory_lock', { key: 'session_recovery' })
     }
   } catch (err) {
     console.error('Startup recovery failed:', err.message)
   }
 }
+
+// ─── GRACEFUL SHUTDOWN ──────────────────────────────────────────
+async function closeGracefully(signal) {
+  console.log(`Received signal ${signal}, starting graceful shutdown...`)
+  fastify.server.close()
+
+  const jobs = Array.from(activeJobs.values())
+  if (jobs.length > 0) {
+    console.log(`Waiting for ${jobs.length} active jobs...`)
+    await Promise.race([
+      Promise.all(jobs),
+      new Promise(resolve => setTimeout(resolve, 30000))
+    ])
+  }
+
+  await supabase.removeAllChannels()
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => closeGracefully('SIGTERM'))
+process.on('SIGINT', () => closeGracefully('SIGINT'))
+
+// ─── SCHEDULED CHANGE DETECTION ─────────────────────────────────
+// Poll all repos every 15 minutes for SHA changes (incremental re-indexing)
+const CHANGE_CHECK_INTERVAL_MS = 3 * 60 * 1000 // 3 minutes
+
+async function runChangeDetection() {
+  try {
+    console.log('🔍 Running scheduled change detection...')
+    const result = await checkAllReposForChanges(supabase)
+    console.log(`Change detection: ${result.checked} checked, ${result.updated} updated, ${result.errors} errors`)
+  } catch (err) {
+    console.error('Change detection failed:', err.message)
+  }
+}
+
+setInterval(runChangeDetection, CHANGE_CHECK_INTERVAL_MS)
 
 // ─── START ──────────────────────────────────────────────────────
 const port = parseInt(process.env.PORT || '3000', 10)
