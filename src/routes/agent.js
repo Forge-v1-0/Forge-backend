@@ -3,6 +3,7 @@ import { loadMemory, writeMemory } from '../services/memory.js'
 import { runPlanner, replanSubtask, generateExplanation } from '../services/planner.js'
 import { runCoder } from '../services/coder.js'
 import { createGithubClient } from '../services/github.js'
+import pLimit from 'p-limit'
 
 // ─── MODEL SANITIZER ─────────────────────────────────────────────
 const DEAD_MODELS = {
@@ -198,11 +199,14 @@ export default async function agentRoutes(fastify) {
       .single()
     if (sessionError) return reply.status(500).send(createError(sessionError.message, 'DB_ERROR'))
 
-    runAgentLoop({ fastify, supabase, sessionId: session.id, repoId: repo_id, ownerId: owner_id, task, plannerModel, coderModel })
+    const jobId = `agent-${session.id}`
+    const promise = runAgentLoop({ fastify, supabase, sessionId: session.id, repoId: repo_id, ownerId: owner_id, task, plannerModel, coderModel })
       .catch(async (err) => {
         console.error(`Agent loop failed for session ${session.id}:`, err)
         await supabase.from('sessions').update({ status: 'failed', error: err.message }).eq('id', session.id)
       })
+    fastify.trackJob(jobId, promise)
+
     return reply.send({ ok: true, session_id: session.id })
   })
 
@@ -228,11 +232,14 @@ export default async function agentRoutes(fastify) {
     }
 
     const planModels = session?.plan || {}
-    runCoderLoop({ fastify, supabase, sessionId: session_id, repoId: session.repo_id, ownerId: owner_id, plannerModel: planModels.plannerModel, coderModel: planModels.coderModel })
+    const jobId = `coder-${session_id}`
+    const promise = runCoderLoop({ fastify, supabase, sessionId: session_id, repoId: session.repo_id, ownerId: owner_id, plannerModel: planModels.plannerModel, coderModel: planModels.coderModel })
       .catch(async (err) => {
         console.error(`Coder loop failed:`, err)
         await supabase.from('sessions').update({ status: 'failed', error: err.message }).eq('id', session_id)
       })
+    fastify.trackJob(jobId, promise)
+
     return reply.send({ ok: true, status: 'coding' })
   })
 
@@ -508,11 +515,14 @@ export default async function agentRoutes(fastify) {
       detail: { feedback, failed_code: draft.new_content }
     })
 
-    runFeedbackLoop({ fastify, supabase, draft, feedback, repoId, sessionId: session.id, ownerId: owner_id, originalTask: session.task, plannerModel: planModels.plannerModel, coderModel: planModels.coderModel })
+    const jobId = `feedback-${draft_id}`
+    const promise = runFeedbackLoop({ fastify, supabase, draft, feedback, repoId, sessionId: session.id, ownerId: owner_id, originalTask: session.task, plannerModel: planModels.plannerModel, coderModel: planModels.coderModel })
       .catch(async (err) => {
         console.error(`Feedback loop failed for draft ${draft_id}:`, err)
         await supabase.from('tasks').update({ status: 'failed', error: err.message }).eq('id', draft.task_id)
       })
+    fastify.trackJob(jobId, promise)
+
     return reply.send({ ok: true })
   })
 }
@@ -597,17 +607,17 @@ export async function runCoderLoop({ fastify, supabase, sessionId, repoId, owner
       .in('task_id', tasks.map(t => t.id))
     const draftTaskIds = new Set(existingDrafts?.map(d => d.task_id) || [])
 
-    let successCount = 0
-    let failCount = 0
-    for (const task of tasks) {
+    // ✅ FIX: Process up to 3 tasks concurrently instead of sequentially
+    const limit = pLimit(3)
+
+    const taskPromises = tasks.map(task => limit(async () => {
       try {
         if (!task.file_path) throw new Error(`Task ${task.id} is missing file_path`)
         const filePath = normalizePath(task.file_path)
 
         if (draftTaskIds.has(task.id)) {
           console.log(`Task ${task.id} already has draft awaiting approval, skipping`)
-          successCount++
-          continue
+          return { taskId: task.id, status: 'skipped' }
         }
 
         // Atomic status update with check
@@ -620,7 +630,7 @@ export async function runCoderLoop({ fastify, supabase, sessionId, repoId, owner
 
         if (!updatedTask) {
           console.log(`Task ${task.id} already being processed, skipping`)
-          continue
+          return { taskId: task.id, status: 'skipped' }
         }
 
         let language = langMap.get(filePath) || 'text'
@@ -656,20 +666,25 @@ export async function runCoderLoop({ fastify, supabase, sessionId, repoId, owner
           explanation, verdict: 'awaiting_approval'
         })
         await supabase.from('tasks').update({ status: 'awaiting_approval' }).eq('id', task.id)
-        successCount++
+        return { taskId: task.id, status: 'success' }
       } catch (err) {
         console.error('DEBUG runCoderLoop task FAILED:', { id: task.id, file: task.file_path, error: err?.message || err })
         await supabase.from('tasks').update({ status: 'failed', error: err?.message || 'Unknown error' }).eq('id', task.id)
-        failCount++
+        return { taskId: task.id, status: 'failed', error: err?.message }
       }
-    }
+    }))
+
+    const results = await Promise.all(taskPromises)
+    const successCount = results.filter(r => r.status === 'success').length
+    const failCount = results.filter(r => r.status === 'failed').length
+    const skippedCount = results.filter(r => r.status === 'skipped').length
 
     if (successCount > 0 && failCount > 0) {
       await supabase.from('sessions').update({
         status: 'partial_success',
         metadata: { failed_tasks: tasks.filter(t => t.status === 'failed').map(t => t.id) }
       }).eq('id', sessionId)
-    } else if (successCount > 0) {
+    } else if (successCount > 0 || skippedCount > 0) {
       await supabase.from('sessions').update({ status: 'awaiting_approval' }).eq('id', sessionId)
     } else {
       await supabase.from('sessions').update({ status: 'failed' }).eq('id', sessionId)
