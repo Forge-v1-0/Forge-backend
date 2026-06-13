@@ -1,5 +1,6 @@
 import { encrypt } from '../services/crypto.js'
 import { createGithubClient } from '../services/github.js'
+import { manualReIndex } from '../services/indexer.js'
 
 function createError(message, code = 'INTERNAL_ERROR', statusCode = 500, details = null) {
   const err = { error: message, code }
@@ -131,6 +132,23 @@ export default async function reposRoutes(fastify) {
       }
     })
   })
+  // ─── MANUAL RE-INDEX ───────────────────────────────────────────
+  fastify.post('/repos/:id/reindex', async (req, reply) => {
+    const owner_id = req.user.id
+    const repoId = parseInt(req.params.id, 10)
+    if (!repoId) {
+      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
+    }
+
+    try {
+      const result = await manualReIndex(supabase, repoId, owner_id)
+      return reply.send({ ok: true, sha: result.sha, message: 'Re-index triggered' })
+    } catch (err) {
+      console.error('Manual re-index failed:', err.message)
+      return reply.status(500).send(createError(err.message, 'REINDEX_FAILED'))
+    }
+  })
+
 }
 
 async function triggerIndexWorkflow(targetRepo, repoId, userPat, sourceRoot) {

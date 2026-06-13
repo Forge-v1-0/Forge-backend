@@ -6,6 +6,7 @@ import { decrypt } from './services/crypto.js'
 import agentRoutes, { runAgentLoop, runCoderLoop } from './routes/agent.js'
 import reposRoutes from './routes/repos.js'
 import settingsRoutes from './routes/settings.js'
+import { checkAllReposForChanges } from './services/indexer.js'
 
 // ─── STARTUP ENV VALIDATION ─────────────────────────────────────
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY', 'FRONTEND_URL', 'ENCRYPTION_KEY']
@@ -295,6 +296,22 @@ async function closeGracefully(signal) {
 
 process.on('SIGTERM', () => closeGracefully('SIGTERM'))
 process.on('SIGINT', () => closeGracefully('SIGINT'))
+
+// ─── SCHEDULED CHANGE DETECTION ─────────────────────────────────
+// Poll all repos every 15 minutes for SHA changes (incremental re-indexing)
+const CHANGE_CHECK_INTERVAL_MS = 3 * 60 * 1000 // 3 minutes
+
+async function runChangeDetection() {
+  try {
+    console.log('🔍 Running scheduled change detection...')
+    const result = await checkAllReposForChanges(supabase)
+    console.log(`Change detection: ${result.checked} checked, ${result.updated} updated, ${result.errors} errors`)
+  } catch (err) {
+    console.error('Change detection failed:', err.message)
+  }
+}
+
+setInterval(runChangeDetection, CHANGE_CHECK_INTERVAL_MS)
 
 // ─── START ──────────────────────────────────────────────────────
 const port = parseInt(process.env.PORT || '3000', 10)
