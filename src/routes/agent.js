@@ -130,12 +130,6 @@ const schemas = {
 
 export default async function agentRoutes(fastify) {
   const supabase = fastify.supabase
-
-  fastify.get('/health', async () => ({
-    status: 'ok',
-    timestamp: new Date().toISOString()
-  }))
-
   // ─── LIST SESSIONS ───────────────────────────────────────────────
   fastify.get('/agent/sessions', async (req, reply) => {
     const owner_id = req.user.id

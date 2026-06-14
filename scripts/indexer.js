@@ -1,7 +1,3 @@
-
-  }
-  process.exit(1)
-})
 import axios from 'axios'
 import { Project, SyntaxKind, Node } from 'ts-morph'
 import { createClient } from '@supabase/supabase-js'
