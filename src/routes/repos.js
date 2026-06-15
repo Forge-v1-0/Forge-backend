@@ -245,6 +245,155 @@ export default async function reposRoutes(fastify) {
     })
   })
 
+
+  // --- SUBGRAPH FOR PLAN REVIEW -------------------------------------------
+  // GET /repos/:id/subgraph?paths[]=src/foo.tsx&paths[]=src/bar.tsx
+  //
+  // Returns the real file-level dependency subgraph for a set of file paths.
+  // Used by PlanReview to show an accurate impact map instead of a fake
+  // circular layout.
+  //
+  // Response: { nodes: [{ id, path, role }], edges: [{ from, to, type }] }
+  fastify.get('/repos/:id/subgraph', async (req, reply) => {
+    const owner_id = req.user.id
+    const repoId   = parseInt(req.params.id, 10)
+
+    if (!repoId) {
+      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
+    }
+
+    // Ownership check
+    const { data: repo } = await supabase
+      .from('repos')
+      .select('id')
+      .eq('id', repoId)
+      .eq('owner_id', owner_id)
+      .single()
+
+    if (!repo) {
+      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
+    }
+
+    // Parse paths[] query param (array or single string)
+    let rawPaths = req.query['paths[]'] || req.query.paths || []
+    if (typeof rawPaths === 'string') rawPaths = [rawPaths]
+    const inputPaths = rawPaths.slice(0, 20).filter(Boolean)
+
+    if (inputPaths.length === 0) {
+      return reply.send({ nodes: [], edges: [] })
+    }
+
+    // Step 1: resolve input paths -> file rows
+    const { data: inputFiles, error: fileErr } = await supabase
+      .from('files')
+      .select('id, path')
+      .eq('repo_id', repoId)
+      .in('path', inputPaths)
+
+    if (fileErr) {
+      return reply.status(500).send(createError(fileErr.message, 'DB_ERROR'))
+    }
+
+    if (!inputFiles || inputFiles.length === 0) {
+      return reply.send({ nodes: [], edges: [] })
+    }
+
+    const inputFileIds = inputFiles.map(f => f.id)
+
+    // Step 2: fetch IMPORTS edges where source is one of our files OR
+    //         the target symbol belongs to one of our files (1-hop reverse)
+    //
+    // We do two separate queries and merge because Supabase does not support
+    // OR across different columns in a single .in() chain efficiently.
+    const [fwdResult, revResult] = await Promise.all([
+      // Forward: files that our input files import
+      supabase
+        .from('edges')
+        .select('source_file_id, to:to_symbol_id(file_id), edge_type')
+        .eq('edge_type', 'IMPORTS')
+        .in('source_file_id', inputFileIds)
+        .limit(200),
+
+      // Reverse: files that import our input files
+      // We join through to_symbol -> symbols -> file_id
+      supabase
+        .from('edges')
+        .select('source_file_id, to:to_symbol_id(file_id), edge_type')
+        .eq('edge_type', 'IMPORTS')
+        .in('to.file_id', inputFileIds)
+        .limit(200),
+    ])
+
+    if (fwdResult.error) {
+      return reply.status(500).send(createError(fwdResult.error.message, 'DB_ERROR'))
+    }
+
+    // Collect all file IDs mentioned in edges
+    const allFileIds = new Set(inputFileIds)
+    const rawEdges   = [...(fwdResult.data || []), ...(revResult.data || [])]
+
+    const edgeList = []
+    for (const e of rawEdges) {
+      const fromId = e.source_file_id
+      const toId   = e.to?.file_id
+      if (!fromId || !toId || fromId === toId) continue
+      allFileIds.add(fromId)
+      allFileIds.add(toId)
+      edgeList.push({ from: fromId, to: toId, type: e.edge_type })
+    }
+
+    // Deduplicate edges
+    const seenEdges = new Set()
+    const dedupedEdges = edgeList.filter(e => {
+      const key = `${e.from}|${e.to}`
+      if (seenEdges.has(key)) return false
+      seenEdges.add(key)
+      return true
+    })
+
+    // Cap total file IDs to avoid large fetches (input files always included)
+    const cappedIds = [
+      ...inputFileIds,
+      ...[...allFileIds].filter(id => !inputFileIds.includes(id)).slice(0, 30)
+    ]
+
+    // Step 3: fetch file metadata for all nodes
+    const { data: nodeFiles, error: nodeErr } = await supabase
+      .from('files')
+      .select('id, path, language')
+      .in('id', cappedIds)
+
+    if (nodeErr) {
+      return reply.status(500).send(createError(nodeErr.message, 'DB_ERROR'))
+    }
+
+    // Step 4: fetch file roles from __file__ symbols
+    const { data: roleSymbols } = await supabase
+      .from('symbols')
+      .select('file_id, metadata')
+      .eq('name', '__file__')
+      .in('file_id', cappedIds)
+
+    const roleMap = new Map()
+    for (const s of roleSymbols || []) {
+      roleMap.set(s.file_id, s.metadata?.fileRole || 'none')
+    }
+
+    const nodes = (nodeFiles || []).map(f => ({
+      id:   f.id,
+      path: f.path,
+      role: roleMap.get(f.id) || 'none',
+    }))
+
+    // Filter edges to only include those between known node IDs
+    const nodeIdSet = new Set(nodes.map(n => n.id))
+    const filteredEdges = dedupedEdges.filter(
+      e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to)
+    )
+
+    return reply.send({ nodes, edges: filteredEdges })
+  })
+
   // ─── SYMBOL DETAIL ───────────────────────────────────────────────
   fastify.get('/repos/:id/graph/symbol/:symbolId', async (req, reply) => {
     const owner_id = req.user.id
