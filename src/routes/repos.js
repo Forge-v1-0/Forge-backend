@@ -132,6 +132,157 @@ export default async function reposRoutes(fastify) {
       }
     })
   })
+
+  // ─── IMPACT PREVIEW ──────────────────────────────────────────────
+  fastify.get('/repos/:id/impact-preview', async (req, reply) => {
+    const owner_id = req.user.id
+    const repoId = parseInt(req.params.id, 10)
+    const q = (req.query.q || '').trim()
+
+    if (!repoId) {
+      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
+    }
+
+    const { data: repo } = await supabase
+      .from('repos')
+      .select('id')
+      .eq('id', repoId)
+      .eq('owner_id', owner_id)
+      .single()
+
+    if (!repo) {
+      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
+    }
+
+    if (!q) {
+      return reply.send({ files: [] })
+    }
+
+    const { data: files, error } = await supabase
+      .from('files')
+      .select('path, language')
+      .eq('repo_id', repoId)
+      .limit(500)
+
+    if (error) {
+      return reply.status(500).send(createError(error.message, 'DB_ERROR'))
+    }
+
+    const keywords = q.toLowerCase().split(/\W+/).filter(Boolean)
+    const scored = (files || []).map(f => {
+      const pathLower = f.path.toLowerCase()
+      const score = keywords.reduce((sum, kw) => sum + (pathLower.includes(kw) ? 1 : 0), 0)
+      return { path: f.path, language: f.language, score }
+    }).filter(f => f.score > 0)
+
+    scored.sort((a, b) => b.score - a.score)
+    const top = scored.slice(0, 8)
+
+    return reply.send({ files: top })
+  })
+
+  // ─── DEPENDENCY GRAPH ────────────────────────────────────────────
+  fastify.get('/repos/:id/graph', async (req, reply) => {
+    const owner_id = req.user.id
+    const repoId = parseInt(req.params.id, 10)
+
+    if (!repoId) {
+      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
+    }
+
+    const { data: repo } = await supabase
+      .from('repos')
+      .select('id')
+      .eq('id', repoId)
+      .eq('owner_id', owner_id)
+      .single()
+
+    if (!repo) {
+      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
+    }
+
+    const { data: files, error: filesError } = await supabase
+      .from('files')
+      .select('id, path, language')
+      .eq('repo_id', repoId)
+      .limit(500)
+
+    if (filesError) {
+      return reply.status(500).send(createError(filesError.message, 'DB_ERROR'))
+    }
+
+    if (!files || files.length === 0) {
+      return reply.send({ files: [], symbols: [], edges: [] })
+    }
+
+    const fileIds = files.map(f => f.id)
+
+    const [symbolsResult, edgesResult] = await Promise.all([
+      supabase
+        .from('symbols')
+        .select('id, file_id, name, kind, exported')
+        .in('file_id', fileIds)
+        .limit(2000),
+      supabase
+        .from('edges')
+        .select('from_symbol_id, to_symbol_id, edge_type, source_file_id')
+        .in('source_file_id', fileIds)
+        .limit(2000)
+    ])
+
+    if (symbolsResult.error) {
+      return reply.status(500).send(createError(symbolsResult.error.message, 'DB_ERROR'))
+    }
+
+    if (edgesResult.error) {
+      return reply.status(500).send(createError(edgesResult.error.message, 'DB_ERROR'))
+    }
+
+    return reply.send({
+      files,
+      symbols: symbolsResult.data || [],
+      edges: edgesResult.data || []
+    })
+  })
+
+  // ─── SYMBOL DETAIL ───────────────────────────────────────────────
+  fastify.get('/repos/:id/graph/symbol/:symbolId', async (req, reply) => {
+    const owner_id = req.user.id
+    const repoId = parseInt(req.params.id, 10)
+    const symbolId = parseInt(req.params.symbolId, 10)
+
+    if (!repoId) {
+      return reply.status(400).send(createError('Invalid repo ID', 'VALIDATION_FAILED', 400))
+    }
+
+    const { data: repo } = await supabase
+      .from('repos')
+      .select('id')
+      .eq('id', repoId)
+      .eq('owner_id', owner_id)
+      .single()
+
+    if (!repo) {
+      return reply.status(403).send(createError('Repo not found or unauthorized', 'FORBIDDEN', 403))
+    }
+
+    const { data, error } = await supabase
+      .from('symbols')
+      .select('*, files(path, repo_id)')
+      .eq('id', symbolId)
+      .single()
+
+    if (error || !data) {
+      return reply.status(404).send(createError('Symbol not found', 'NOT_FOUND', 404))
+    }
+
+    if (data.files?.repo_id !== repoId) {
+      return reply.status(404).send(createError('Symbol not found in this repo', 'NOT_FOUND', 404))
+    }
+
+    return reply.send({ symbol: data })
+  })
+
   // ─── MANUAL RE-INDEX ───────────────────────────────────────────
   fastify.post('/repos/:id/reindex', async (req, reply) => {
     const owner_id = req.user.id
